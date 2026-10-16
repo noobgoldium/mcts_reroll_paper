@@ -1,0 +1,41 @@
+name: MCTS Massive Simulation
+
+on:
+  workflow_dispatch: # 수동으로 언제든 재시작 가능
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Git User
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install GCC-14 & Build
+        run: |
+          sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
+          sudo apt-get update
+          sudo apt-get install -y g++-14
+          g++-14 -O3 -march=native -flto -funroll-loops -pipe -std=c++26 -pthread mcts_engine.cpp -o mcts_engine
+
+      - name: Run MCTS Engine with Auto-Commit
+        run: |
+          # 백그라운드로 돌리면서, 주기적으로 깃허브에 결과 CSV를 자동 커밋/푸시하는 스크립트 실행
+          ./mcts_engine &
+          
+          # 엔진이 돌면서 CSV를 떨굴 때마다 레포지토리에 자동 동기화
+          while kill -0 $! 2>/dev/null; do
+            sleep 300 # 5분마다 체크
+            git add *.csv || true
+            git commit -m "Auto-save MCTS chunk progress [skip ci]" || true
+            git push || true
+          done
+          
+          # 최종 남은 파일 최종 푸시
+          git add *.csv || true
+          git commit -m "Final MCTS results push [skip ci]" || true
+          git push || true
