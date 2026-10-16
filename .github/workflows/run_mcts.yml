@@ -3,11 +3,17 @@ name: MCTS Massive Simulation
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  
+    - cron: '0 */6 * * *'  # 6시간마다 깃허브가 단독으로 자동 실행
 
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
+    
+    # 💡 핵심: 동시에 여러 작업이 겹치지 않게 하나로 제어 (중복 실행 방지)
+    concurrency:
+      group: mcts-simulation
+      cancel-in-progress: false
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,7 +35,7 @@ jobs:
           # 1. 백그라운드로 엔진 실행
           ./mcts_engine &
           
-          # 2. 5분마다 결과 CSV를 깃허브 레포지토리에 자동 백업 (커밋 & 푸시)
+          # 2. 5분마다 결과 CSV를 깃허브 레포지토리에 자동 백업
           while kill -0 $! 2>/dev/null; do
             sleep 300
             git pull --rebase || true
@@ -43,21 +49,3 @@ jobs:
           git add biscuit_tier_*.csv || true
           git commit -m "Final MCTS results push [skip ci]" || true
           git push || true
-
-      - name: Auto-trigger next run if incomplete
-        if: always()
-        run: |
-          # 총 50개 청크 중 아직 완성 안 된 것이 있다면 다음 릴레이 자동 예약
-          COMPLETED_COUNT=$(ls biscuit_tier_*.csv 2>/dev/null | wc -l)
-          echo "현재 완성된 청크 수: $COMPLETED_COUNT / 50"
-          
-          if [ "$COMPLETED_COUNT" -lt 50 ]; then
-            echo "아직 연산이 남았으므로 다음 릴레이를 자동 호출합니다."
-            curl -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/${{ github.repository }}/actions/workflows/run_mcts.yml/dispatches \
-              -d '{"ref":"main"}'
-          else
-            echo "모든 연산(50개 청크)이 완벽하게 끝났습니다!"
-          fi
