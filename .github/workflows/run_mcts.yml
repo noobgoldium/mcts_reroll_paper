@@ -2,10 +2,6 @@ name: MCTS Massive Simulation
 
 on:
   workflow_dispatch:
-  workflow_run:
-    workflows: ["MCTS Massive Simulation"]
-    types:
-      - completed
 
 jobs:
   build-and-run:
