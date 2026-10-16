@@ -12,7 +12,7 @@ jobs:
     # 💡 핵심: 동시에 여러 작업이 겹치지 않게 하나로 제어 (중복 실행 방지)
     concurrency:
       group: mcts-simulation
-      cancel-in-progress: false
+      cancel-in-progress: true
 
     steps:
       - name: Checkout repository
