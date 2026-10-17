@@ -3,16 +3,15 @@ name: MCTS Massive Simulation
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # 6시간마다 깃허브가 단독으로 자동 실행
+    - cron: '0 */6 * * *'  # 6시간마다 자동 실행
 
 jobs:
   build-and-run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # 💡 핵심 1: 최신 Ubuntu 24.04 환경 사용 (GCC-14 기본 내장)
     
-    # 💡 핵심: 동시에 여러 작업이 겹치지 않게 하나로 제어 (중복 실행 방지)
     concurrency:
       group: mcts-simulation
-      cancel-in-progress: true
+      cancel-in-progress: true # 💡 레이스 컨디션 방지를 위해 유지
 
     steps:
       - name: Checkout repository
@@ -23,11 +22,9 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Install GCC-14 & Build
+      - name: Build MCTS Engine
         run: |
-          sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
-          sudo apt-get update
-          sudo apt-get install -y g++-14
+          # 💡 핵심 2: 불안정한 PPA 추가 및 apt-get install 과정을 완전히 제거
           g++-14 -O3 -march=native -flto -funroll-loops -pipe -std=c++26 -pthread mcts_engine.cpp -o mcts_engine
 
       - name: Run MCTS Engine with Auto-Commit
