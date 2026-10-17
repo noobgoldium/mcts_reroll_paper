@@ -87,6 +87,7 @@ jobs:
           fi
 
       # 💡 안전하게 바톤 터치 (다음 러너 깨우기)
+            # 💡 깃허브 변수 문법(${{ ... }}) 오타와 curl JSON 데이터 전달 방식을 정석대로 수정한 버전
       - name: 🔄 Trigger Next Chunk (Self-Wakeup)
         if: always()
         run: |
@@ -94,5 +95,5 @@ jobs:
           curl -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com{{ github.repository }}/dispatches \
+            "https://github.com{{ github.repository }}/dispatches" \
             -d '{"event_type": "next_chunk"}'
