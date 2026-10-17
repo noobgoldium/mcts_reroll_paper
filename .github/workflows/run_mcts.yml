@@ -83,7 +83,7 @@ jobs:
           if git status --porcelain | grep -q "biscuit_tier_.*\.csv"; then
             git add biscuit_tier_*.csv
             git commit -m "Final MCTS results push [skip ci]"
-            git push origin main || true
+            git push -f origin main || true
           fi
 
       # 💡 안전하게 바톤 터치 (다음 러너 깨우기)
