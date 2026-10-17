@@ -3,46 +3,96 @@ name: MCTS Massive Simulation
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # 6시간마다 자동 실행
+    - cron: '0 */6 * * *' # 크론은 백업용으로만 유지
+  repository_dispatch:
+    types: [next_chunk] # 다음 청크를 안전하게 이어받는 트리거
+
+concurrency:
+  group: mcts-simulation
+  cancel-in-progress: false
 
 jobs:
   build-and-run:
-    runs-on: ubuntu-24.04  # 💡 핵심 1: 최신 Ubuntu 24.04 환경 사용 (GCC-14 기본 내장)
+    runs-on: ubuntu-24.04
     
-    concurrency:
-      group: mcts-simulation
-      cancel-in-progress: true # 💡 레이스 컨디션 방지를 위해 유지
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 💡 동시 실행 방지 안전장치 (동시 실행 시 1초 만에 자동 종료)
+      - name: Check for concurrent runs
+        uses: softprops/turnstyle@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          same-branch-only: true
+          abort-after-seconds: 1
 
       - name: Setup Git User
         run: |
           git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.email "github-actions[bot]@://github.com"
 
       - name: Build MCTS Engine
         run: |
-          # 💡 핵심 2: 불안정한 PPA 추가 및 apt-get install 과정을 완전히 제거
           g++-14 -O3 -march=native -flto -funroll-loops -pipe -std=c++26 -pthread mcts_engine.cpp -o mcts_engine
 
-      - name: Run MCTS Engine with Auto-Commit
+      - name: Run MCTS Engine with Soft Timeout & Auto-Commit
         run: |
-          # 1. 백그라운드로 엔진 실행
+          # 1. MCTS 엔진 백그라운드 실행
           ./mcts_engine &
+          ENGINE_PID=$!
           
-          # 2. 5분마다 결과 CSV를 깃허브 레포지토리에 자동 백업
-          while kill -0 $! 2>/dev/null; do
-            sleep 300
-            git pull --rebase || true
-            git add biscuit_tier_*.csv || true
-            git commit -m "Auto-save MCTS chunk progress [skip ci]" || true
-            git push || true
-          done
+          # 2. 5분마다 자동 저장 루프
+          (
+            while kill -0 $ENGINE_PID 2>/dev/null; do
+              sleep 300
+              if ! kill -0 $ENGINE_PID 2>/dev/null; then break; fi
+              
+              if git status --porcelain | grep -q "biscuit_tier_.*\.csv"; then
+                git pull --rebase origin main || true
+                git add biscuit_tier_*.csv
+                git commit -m "Auto-save MCTS chunk progress [skip ci]"
+                git push origin main || true
+              fi
+            done
+          ) &
+          LOOP_PID=$!
           
-          # 3. 종료 직전 최종 남은 파일 강제 푸시
-          git pull --rebase || true
-          git add biscuit_tier_*.csv || true
-          git commit -m "Final MCTS results push [skip ci]" || true
-          git push || true
+          # 3. 💡 5시간 40분 소프트 타임아웃 설정 (엔진 내부 로직이 없으므로 강제 종료 처리)
+          (
+            sleep 20400
+            if kill -0 $ENGINE_PID 2>/dev/null; then
+              echo "⚠️ 5시간 40분 도달. 5개 청크 완료 예상 시점이므로 엔진을 강제 종료(SIGKILL)합니다."
+              kill -9 $ENGINE_PID 2>/dev/null # 엔진 강제 종료
+            fi
+          ) &
+          TIMEOUT_PID=$!
+          
+          # 4. 엔진 종료 대기
+          wait $ENGINE_PID || true
+          
+          # 5. 타이머 및 백그라운드 루프 종료
+          kill $LOOP_PID $TIMEOUT_PID 2>/dev/null || true
+          
+          # 6. 강제 종료 직전까지 쌓인 최종 데이터 마감 푸시
+          echo "Engine finished or stopped. Starting final push..."
+          git pull --rebase origin main || true
+          if git status --porcelain | grep -q "biscuit_tier_.*\.csv"; then
+            git add biscuit_tier_*.csv
+            git commit -m "Final MCTS results push [skip ci]"
+            git push origin main || true
+          fi
+
+      # 💡 안전하게 바톤 터치 (다음 러너 깨우기)
+      - name: 🔄 Trigger Next Chunk (Self-Wakeup)
+        if: always()
+        run: |
+          echo "🚀 모든 데이터 저장이 완료되었습니다. 다음 청크를 안전하게 호출합니다."
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://github.com{{ github.repository }}/dispatches \
+            -d '{"event_type": "next_chunk"}'
