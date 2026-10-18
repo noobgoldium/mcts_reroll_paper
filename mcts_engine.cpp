@@ -1,5 +1,5 @@
 /**
- * mcts_engine.cpp — 비스킷 리롤 MCTS 엔진 (Resume + 즉시저장 버전)
+ * mcts_engine.cpp — 비스킷 리롤 MCTS 엔진 (Resume 허점 완벽 해결 버전)
  */
 #include <mutex>
 #include <algorithm>
@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 #include <array>
+#include <unordered_set>
 
  // ── 옵션 ──────────────────────────────────────────────────
 struct Option { std::string name; float lo, hi; };
@@ -410,22 +411,26 @@ void append_csv(const std::vector<Record>& records, const std::string& path, std
     }
 }
 
-// ── 마지막 biscuit_id 읽기 (resume용) ────────────────────
-// biscuit_id는 뒤에서 3번째 컬럼
-int get_last_biscuit_id(const std::string& path) {
+// ── 완료된 모든 biscuit_id 읽기 (Resume 허점 방지) ────────
+std::unordered_set<int> get_completed_biscuit_ids(const std::string& path) {
+    std::unordered_set<int> completed;
     std::ifstream f(path);
-    if (!f.good()) return -1;
-    std::string line, last;
-    while (std::getline(f, line))
-        if (!line.empty()) last = line;
-    if (last.empty() || last.find("tier_0") != std::string::npos) return -1; // 헤더만 있음
-    std::stringstream ss(last);
-    std::string tok;
-    std::vector<std::string> cols;
-    while (std::getline(ss, tok, ',')) cols.push_back(tok);
-    if (cols.size() < 3) return -1;
-    try { return std::stoi(cols[cols.size() - 3]); }
-    catch (...) { return -1; }
+    if (!f.good()) return completed;
+    std::string line;
+    std::getline(f, line); // 헤더 스킵
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string tok;
+        std::vector<std::string> cols;
+        while (std::getline(ss, tok, ',')) cols.push_back(tok);
+        if (cols.size() >= 3) {
+            try {
+                completed.insert(std::stoi(cols[cols.size() - 3]));
+            } catch (...) {}
+        }
+    }
+    return completed;
 }
 
 // ── 초기 상태 생성 ────────────────────────────────────────
@@ -471,8 +476,7 @@ struct MCTSConfig {
 };
 
 // ── 파이프라인 (biscuit 1개 끝날 때마다 즉시 append) ─────
-// ── [안전성 + 병목제거] 파이프라인 버퍼링 버전 ─────
-void run_mcts_pipeline(const MCTSConfig& cfg, int resume_from) {
+void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& completed_ids) {
     std::mt19937 rng{ 42u };
     auto inits = generate_inits(cfg.init_biscuit, cfg.n_starts, rng);
 
@@ -480,36 +484,27 @@ void run_mcts_pipeline(const MCTSConfig& cfg, int resume_from) {
     std::mutex save_mutex;
 
     auto t0 = std::chrono::steady_clock::now();
-    auto last_flush_time = std::chrono::steady_clock::now();
 
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 2; 
-    
+    const unsigned int num_threads = 2;
     std::vector<std::thread> workers;
     int chunk_size = cfg.n_starts / num_threads;
 
-    // 전역 파일 공유를 방지하기 위해 각 스레드가 자기 버퍼에 채우고, 
-    // 조건이 만족될 때만 뮤텍스를 잡고 한 번에 파일에 털어 넣습니다.
     for (unsigned int t = 0; t < num_threads; ++t) {
         int start_idx = static_cast<int>(t) * chunk_size;
         int end_idx = (t == num_threads - 1) ? cfg.n_starts : (static_cast<int>(t) + 1) * chunk_size;
 
         workers.emplace_back([&, start_idx, end_idx]() {
             std::vector<Node> local_node_pool;
-            local_node_pool.reserve(2500000);
-
-            std::vector<Record> local_record_buffer;
-            local_record_buffer.reserve(20000); // 메모리 버퍼
+            local_node_pool.reserve(2000000);
 
             for (int i = start_idx; i < end_idx; ++i) {
-                if (i <= resume_from) {
+                // 완벽한 개별 ID 체크 (중간 구멍 방지)
+                if (completed_ids.find(i) != completed_ids.end()) {
                     ++done;
                     continue;
                 }
 
                 local_node_pool.clear();
-                local_node_pool.reserve(2500000);
-
                 MCTSTree tree(local_node_pool, inits[i],
                     cfg.budget_g, cfg.budget_l, cfg.goal, cfg.max_rollout);
                 tree.run(cfg.n_sim);
@@ -520,33 +515,16 @@ void run_mcts_pipeline(const MCTSConfig& cfg, int resume_from) {
                         r.goal_id = cfg.goal_id;
                         r.resource_tier = cfg.resource_tier;
                         r.biscuit_id = i;
-                        local_record_buffer.push_back(r);
                     }
+                    // 즉시 append
+                    append_csv(recs, cfg.output_path, save_mutex);
                 }
 
                 int cnt = ++done;
-
-                // 💡 [핵심 타협점] 비스킷 1,000개가 쌓였거나, 
-                // 혹은 마지막 비스킷이거나, 마지막 저장 후 1분이 지났다면 디스크에 Flush!
-                auto now = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - last_flush_time).count();
-
-                if (local_record_buffer.size() >= 10000 || duration >= 60 || i == end_idx - 1) {
-                    if (!local_record_buffer.empty()) {
-                        append_csv(local_record_buffer, cfg.output_path, save_mutex);
-                        local_record_buffer.clear();
-                        
-                        // 공용 타임스탬프 갱신 (대략적인 주기 동기화)
-                        if (duration >= 60) {
-                            last_flush_time = now;
-                        }
-                    }
-                }
-
                 if (cnt % 10000 == 0)
                     std::cout << "  " << cnt << "/" << cfg.n_starts << std::endl;
             }
-        });
+            });
     }
 
     for (auto& w : workers) if (w.joinable()) w.join();
@@ -555,7 +533,6 @@ void run_mcts_pipeline(const MCTSConfig& cfg, int resume_from) {
         std::chrono::steady_clock::now() - t0).count();
     std::cout << "\n[MCTS] 탐색 완료: " << elapsed << "초\n";
 }
-
 
 // ── 메인 ──────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
@@ -600,28 +577,29 @@ int main(int argc, char* argv[]) {
             cfg.n_sim = 500;
             cfg.output_path = filename;
 
-            // resume: 마지막 완료된 biscuit_id 확인
-            int last_bid = get_last_biscuit_id(filename);
+            // 파일 전체를 읽어 완료된 biscuit_id 세트 구성
+            std::unordered_set<int> completed_ids = get_completed_biscuit_ids(filename);
+            int total_completed = static_cast<int>(completed_ids.size());
 
-            // 완전히 끝난 청크면 skip
-            if (last_bid >= cfg.n_starts - 1) {
-                std::cout << "\n[Skip] 완료된 청크: " << filename << "\n";
+            // 완전히 다 끝난 청크면 skip
+            if (total_completed >= cfg.n_starts) {
+                std::cout << "\n[Skip] 완료된 청크: " << filename << " (" << total_completed << "/" << cfg.n_starts << ")\n";
                 continue;
             }
 
             // 파일 없으면 헤더 생성
-            if (last_bid < 0) {
+            if (total_completed == 0) {
                 std::ofstream hdr(filename);
                 hdr << CSV_HEADER;
                 std::cout << "\n[New ] " << filename << " 생성\n";
             }
             else {
                 std::cout << "\n[Resume] " << filename
-                    << " (biscuit_id " << last_bid + 1 << "부터 이어서)\n";
+                    << " (이미 완료된 항목: " << total_completed << "개, 빠진 구간 메우기 시작)\n";
             }
 
             std::cout << "[Tier " << ti << " Goal " << gi << " 시작]\n";
-            run_mcts_pipeline(cfg, last_bid);
+            run_mcts_pipeline(cfg, completed_ids);
         }
     }
 
