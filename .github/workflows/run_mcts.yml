@@ -33,7 +33,7 @@ jobs:
       - name: Setup Git User
         run: |
           git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@://github.com"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Build MCTS Engine
         run: |
@@ -61,12 +61,12 @@ jobs:
           ) &
           LOOP_PID=$!
           
-          # 3. 💡 5시간 40분 소프트 타임아웃 설정 (엔진 내부 로직이 없으므로 강제 종료 처리)
+          # 3. 💡 5시간 40분 소프트 타임아웃 설정
           (
             sleep 20400
             if kill -0 $ENGINE_PID 2>/dev/null; then
-              echo "⚠️ 5시간 40분 도달. 5개 청크 완료 예상 시점이므로 엔진을 강제 종료(SIGKILL)합니다."
-              kill -9 $ENGINE_PID 2>/dev/null # 엔진 강제 종료
+              echo "⚠️ 5시간 40분 도달. 엔진을 강제 종료(SIGKILL)합니다."
+              kill -9 $ENGINE_PID 2>/dev/null
             fi
           ) &
           TIMEOUT_PID=$!
@@ -86,8 +86,7 @@ jobs:
             git push -f origin main || true
           fi
 
-      # 💡 안전하게 바톤 터치 (다음 러너 깨우기)
-            # 💡 깃허브 변수 문법(${{ ... }}) 오타와 curl JSON 데이터 전달 방식을 정석대로 수정한 버전
+      # 💡 API 주소, 달러($) 기호, C++26 버전까지 모두 마감된 웨이크업 스텝
       - name: 🔄 Trigger Next Chunk (Self-Wakeup)
         if: always()
         run: |
@@ -95,5 +94,5 @@ jobs:
           curl -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://github.com{{ github.repository }}/dispatches" \
+            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
             -d '{"event_type": "next_chunk"}'
