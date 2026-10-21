@@ -1,12 +1,11 @@
 /**
- * mcts_engine.cpp — 비스킷 리롤 MCTS 엔진 (Resume 허점 완벽 해결 버전)
+ * mcts_engine.cpp — 비스킷 리롤 MCTS 엔진 (락프리 링버퍼 + 완벽한 종료/드레이닝 마감 버전)
  */
 #include <mutex>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <execution>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -299,6 +298,7 @@ struct MCTSTree {
         int bg = nodes[static_cast<size_t>(idx)].bg;
         int bl = nodes[static_cast<size_t>(idx)].bl;
         bool success = false;
+        
         for (int step = 0; step < max_rollout; ++step) {
             if (check_goal(b, goal)) { success = true; break; }
             int a = -1;
@@ -387,6 +387,72 @@ struct MCTSTree {
     }
 };
 
+// ── 고성능 락프리 링버퍼 (MPSC) ────────────────────────────
+template <typename T, size_t Capacity>
+class LockFreeMPSCQueue {
+private:
+    struct Cell {
+        std::atomic<size_t> sequence;
+        T data;
+    };
+
+    Cell buffer[Capacity];
+    
+    alignas(64) std::atomic<size_t> head{0};
+    alignas(64) std::atomic<size_t> tail{0};
+
+public:
+    LockFreeMPSCQueue() {
+        for (size_t i = 0; i < Capacity; ++i) {
+            buffer[i].sequence.store(i, std::memory_order_relaxed);
+        }
+    }
+
+    bool push(const T& data) {
+        Cell* cell;
+        size_t t = tail.load(std::memory_order_relaxed);
+        while (true) {
+            cell = &buffer[t & (Capacity - 1)];
+            size_t seq = cell->sequence.load(std::memory_order_acquire);
+            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(t);
+            if (diff == 0) {
+                if (tail.compare_exchange_weak(t, t + 1, std::memory_order_relaxed)) {
+                    break;
+                }
+            } else if (diff < 0) {
+                return false; 
+            } else {
+                t = tail.load(std::memory_order_relaxed);
+            }
+        }
+        cell->data = data;
+        cell->sequence.store(t + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(T& data) {
+        Cell* cell;
+        size_t h = head.load(std::memory_order_relaxed);
+        while (true) {
+            cell = &buffer[h & (Capacity - 1)];
+            size_t seq = cell->sequence.load(std::memory_order_acquire);
+            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(h + 1);
+            if (diff == 0) {
+                if (head.compare_exchange_weak(h, h + 1, std::memory_order_relaxed)) {
+                    break;
+                }
+            } else if (diff < 0) {
+                return false; 
+            } else {
+                h = head.load(std::memory_order_relaxed);
+            }
+        }
+        data = cell->data;
+        cell->sequence.store(h + Capacity, std::memory_order_release);
+        return true;
+    }
+};
+
 // ── CSV 헤더 ──────────────────────────────────────────────
 static const std::string CSV_HEADER =
 "tier_0,tier_1,tier_2,tier_3,tier_4,progress,budget_g,budget_l,"
@@ -395,29 +461,12 @@ static const std::string CSV_HEADER =
 "best_action,best_q,q_general,q_light_avg,"
 "goal_id,resource_tier,biscuit_id,matched_at_switch,bl_remaining_at_switch\n";
 
-// ── CSV append (헤더 없이 데이터만) ──────────────────────
-void append_csv(const std::vector<Record>& records, const std::string& path, std::mutex& mtx) {
-    std::lock_guard<std::mutex> lock(mtx);
-    std::ofstream f(path, std::ios::app);
-    for (const auto& r : records) {
-        for (int t : r.tier_counts) f << t << ",";
-        f << r.progress << "," << r.bg << "," << r.bl;
-        for (int t : r.opt_max_tier) f << "," << t;
-        f << "," << r.best_action << "," << r.best_q
-            << "," << r.q_general << "," << r.q_light_avg
-            << "," << r.goal_id << "," << r.resource_tier
-            << "," << r.biscuit_id << "," << r.matched_at_switch
-            << "," << r.bl_remaining_at_switch << "\n";
-    }
-}
-
-// ── 완료된 모든 biscuit_id 읽기 (Resume 허점 방지) ────────
 std::unordered_set<int> get_completed_biscuit_ids(const std::string& path) {
     std::unordered_set<int> completed;
     std::ifstream f(path);
     if (!f.good()) return completed;
     std::string line;
-    std::getline(f, line); // 헤더 스킵
+    std::getline(f, line);
     while (std::getline(f, line)) {
         if (line.empty()) continue;
         std::stringstream ss(line);
@@ -433,7 +482,6 @@ std::unordered_set<int> get_completed_biscuit_ids(const std::string& path) {
     return completed;
 }
 
-// ── 초기 상태 생성 ────────────────────────────────────────
 std::vector<Biscuit> generate_inits(const Biscuit& base, int n, std::mt19937& rng) {
     (void)rng;
     std::vector<Biscuit> inits(static_cast<size_t>(n));
@@ -461,7 +509,6 @@ std::vector<Biscuit> generate_inits(const Biscuit& base, int n, std::mt19937& rn
     return inits;
 }
 
-// ── MCTSConfig ────────────────────────────────────────────
 struct MCTSConfig {
     Biscuit init_biscuit = { Slot{ 0, 3.0f }, Slot{ 1, 5.0f }, Slot{ 3, 3.0f }, Slot{ 4, 3.0f } };
     Goal goal = { { 3, 2, 3 },{ 4, 2, 3 } };
@@ -475,15 +522,69 @@ struct MCTSConfig {
     std::string output_path = "";
 };
 
-// ── 파이프라인 (biscuit 1개 끝날 때마다 즉시 append) ─────
+// ── 마감된 파이프라인 (완벽한 잔여 데이터 드레이닝 + 파일 예외 처리) ──
 void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& completed_ids) {
     std::mt19937 rng{ 42u };
     auto inits = generate_inits(cfg.init_biscuit, cfg.n_starts, rng);
 
     std::atomic<int> done{ 0 };
-    std::mutex save_mutex;
+    std::atomic<bool> producer_finished{ false };
+
+    LockFreeMPSCQueue<Record, 65536> queue;
 
     auto t0 = std::chrono::steady_clock::now();
+
+    // 백그라운드 I/O 스레드 (마감 완료: 드레이닝 및 예외 처리 포함)
+    std::thread io_thread([&]() {
+        std::ofstream f(cfg.output_path, std::ios::app);
+        if (!f.is_open()) {
+            std::cerr << "[Error] 출력 파일 오픈 실패: " << cfg.output_path << std::endl;
+            return;
+        }
+
+        std::vector<Record> write_buffer;
+        write_buffer.reserve(1000);
+
+        auto flush_buffer = [&](const std::vector<Record>& buf) {
+            if (buf.empty()) return;
+            for (const auto& r : buf) {
+                for (int t : r.tier_counts) f << t << ",";
+                f << r.progress << "," << r.bg << "," << r.bl;
+                for (int t : r.opt_max_tier) f << "," << t;
+                f << "," << r.best_action << "," << r.best_q
+                  << "," << r.q_general << "," << r.q_light_avg
+                  << "," << r.goal_id << "," << r.resource_tier
+                  << "," << r.biscuit_id << "," << r.matched_at_switch
+                  << "," << r.bl_remaining_at_switch << "\n";
+            }
+            f.flush(); // 디스크 쓰기 보장
+        };
+
+        Record rec;
+        while (true) {
+            if (queue.pop(rec)) {
+                write_buffer.push_back(rec);
+                if (write_buffer.size() >= 1000) {
+                    flush_buffer(write_buffer);
+                    write_buffer.clear();
+                }
+            } else {
+                // 워커들이 모두 끝났다는 신호가 들어왔을 때
+                if (producer_finished.load(std::memory_order_acquire)) {
+                    // 큐에 남은 데이터가 완벽히 비워질 때까지 한 번 더 확인 (Double-check Draining)
+                    if (!queue.pop(rec)) {
+                        break; // 완전히 비었음이 확인되면 안전하게 탈출
+                    }
+                    write_buffer.push_back(rec);
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        }
+
+        // 마지막 잔여 버퍼 플러시
+        flush_buffer(write_buffer);
+    });
 
     const unsigned int num_threads = 2;
     std::vector<std::thread> workers;
@@ -498,7 +599,6 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
             local_node_pool.reserve(2000000);
 
             for (int i = start_idx; i < end_idx; ++i) {
-                // 완벽한 개별 ID 체크 (중간 구멍 방지)
                 if (completed_ids.find(i) != completed_ids.end()) {
                     ++done;
                     continue;
@@ -515,19 +615,26 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
                         r.goal_id = cfg.goal_id;
                         r.resource_tier = cfg.resource_tier;
                         r.biscuit_id = i;
+                        
+                        while (!queue.push(r)) {
+                            std::this_thread::yield();
+                        }
                     }
-                    // 즉시 append
-                    append_csv(recs, cfg.output_path, save_mutex);
                 }
 
                 int cnt = ++done;
                 if (cnt % 10000 == 0)
                     std::cout << "  " << cnt << "/" << cfg.n_starts << std::endl;
             }
-            });
+        });
     }
 
+    // 워커 스레드 종료 대기 완료 후 프로듀서 마감 신호 전송
     for (auto& w : workers) if (w.joinable()) w.join();
+    producer_finished.store(true, std::memory_order_release);
+
+    // I/O 스레드가 남은 큐를 모두 비우고 종료될 때까지 안전하게 대기
+    if (io_thread.joinable()) io_thread.join();
 
     double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
@@ -577,17 +684,14 @@ int main(int argc, char* argv[]) {
             cfg.n_sim = 500;
             cfg.output_path = filename;
 
-            // 파일 전체를 읽어 완료된 biscuit_id 세트 구성
             std::unordered_set<int> completed_ids = get_completed_biscuit_ids(filename);
             int total_completed = static_cast<int>(completed_ids.size());
 
-            // 완전히 다 끝난 청크면 skip
             if (total_completed >= cfg.n_starts) {
                 std::cout << "\n[Skip] 완료된 청크: " << filename << " (" << total_completed << "/" << cfg.n_starts << ")\n";
                 continue;
             }
 
-            // 파일 없으면 헤더 생성
             if (total_completed == 0) {
                 std::ofstream hdr(filename);
                 hdr << CSV_HEADER;
