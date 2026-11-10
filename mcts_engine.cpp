@@ -1,5 +1,6 @@
 /**
- * mcts_engine.cpp — 캐시 미스 저격 및 극한의 CPU 최적화 버전 (데이터 무결성 100% 보존)
+ * mcts_engine.cpp — 동작 보존형 최적화 버전
+ * RNG, RNG 호출 순서, MCTS 정책, 게임 규칙 및 CSV 스키마는 변경하지 않는다.
  */
 #include <mutex>
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <thread>
 #include <vector>
 #include <array>
+#include <memory>
 #include <unordered_set>
 
 // ── 캐시 최적화: 벡터 간접 참조를 없애고 CPU 레지스터/L1 캐시에 박히는 정적 배열 사용 ──
@@ -30,20 +32,20 @@ static constexpr float WEIGHTS[N_OPTS] = {
     1.f, 1.f, 1.f, 5.f, 1.f, 5.f, 5.f, 1.f, 1.f, 1.f, 5.f, 5.f
 };
 
-static std::vector<std::vector<float>> OPT_VALS;
-static std::vector<int> OPT_SIZES;
+// 옵션별 값 테이블을 단일 연속 메모리 영역에 배치해 간접 참조와
+// 개별 할당을 제거한다. 현재 최대 옵션 범위는 121개 값이다.
+static constexpr int MAX_OPT_VALUES = 121;
+static std::array<std::array<float, MAX_OPT_VALUES>, N_OPTS> OPT_VALS{};
+static std::array<int, N_OPTS> OPT_SIZES{};
 
 void build_opt_vals() {
-    OPT_VALS.resize(N_OPTS);
-    OPT_SIZES.resize(N_OPTS);
     for (int i = 0; i < N_OPTS; ++i) {
         float lo = OPT_LO[i], hi = OPT_HI[i];
         int steps = static_cast<int>(std::round((hi - lo) / 0.1f)) + 1;
-        OPT_VALS[i].resize(static_cast<size_t>(steps));
         OPT_SIZES[i] = steps;
         for (int j = 0; j < steps; ++j)
             OPT_VALS[i][static_cast<size_t>(j)] =
-            std::round((lo + static_cast<float>(j) * 0.1f) * 10.f) / 10.f;
+                std::round((lo + static_cast<float>(j) * 0.1f) * 10.f) / 10.f;
     }
 }
 
@@ -293,10 +295,19 @@ struct MCTSTree {
         int bl = nodes[idx].bl;
         bool success = false;
         
+        // Goal의 요구 슬롯 수는 롤아웃 동안 변하지 않으므로 한 번만 계산한다.
+        int total_required = 0;
+        for (const auto& g : goal) total_required += g.required;
+
         for (int step = 0; step < max_rollout; ++step) {
-            if (check_goal(b, goal)) { success = true; break; }
-            int a = -1;
+            // 기존 check_goal()과 동일한 매칭 결과를 재사용한다.
+            // 이전 구현은 같은 상태에서 get_matched_slots()를 연속 두 번 호출했다.
             auto matched = get_matched_slots(b, goal);
+            int matched_count = 0;
+            for (bool m : matched) if (m) ++matched_count;
+            if (matched_count >= total_required) { success = true; break; }
+
+            int a = -1;
             std::array<int, 4> unmatched_actions{};
             int unmatched_cnt = 0;
             for (int i = 0; i < 4; ++i)
@@ -368,7 +379,9 @@ struct MCTSTree {
             rec.opt_max_tier.fill(0);
             for (const auto& s : node.biscuit) {
                 int t = get_tier(s.opt_idx, s.val);
-                rec.tier_counts[t]++;
+                // get_tier() returns tiers 1..5; CSV columns tier_0..tier_4 are zero-based.
+                if (t >= 1 && t <= static_cast<int>(rec.tier_counts.size()))
+                    rec.tier_counts[static_cast<size_t>(t - 1)]++;
                 int& mx = rec.opt_max_tier[s.opt_idx];
                 if (t > mx) mx = t;
             }
@@ -392,7 +405,9 @@ private:
 
     Cell buffer[Capacity];
     
-    alignas(64) std::atomic<size_t> head{0};
+    // pop()은 I/O 스레드 하나만 호출한다. 소비자 전용 head는 비원자 변수로 둔다.
+    // 여러 Worker가 공유하는 tail은 원자성을 유지한다.
+    size_t head = 0;
     alignas(64) std::atomic<size_t> tail{0};
 
 public:
@@ -425,24 +440,15 @@ public:
     }
 
     bool pop(T& data) {
-        Cell* cell;
-        size_t h = head.load(std::memory_order_relaxed);
-        while (true) {
-            cell = &buffer[h & (Capacity - 1)];
-            size_t seq = cell->sequence.load(std::memory_order_acquire);
-            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(h + 1);
-            if (diff == 0) {
-                if (head.compare_exchange_weak(h, h + 1, std::memory_order_relaxed)) {
-                    break;
-                }
-            } else if (diff < 0) {
-                return false; 
-            } else {
-                h = head.load(std::memory_order_relaxed);
-            }
-        }
+        const size_t h = head;
+        Cell* cell = &buffer[h & (Capacity - 1)];
+        const size_t seq = cell->sequence.load(std::memory_order_acquire);
+        // 단일 소비자이므로 head 경합/재시도는 존재하지 않는다.
+        if (seq != h + 1) return false;
+
         data = cell->data;
         cell->sequence.store(h + Capacity, std::memory_order_release);
+        head = h + 1;
         return true;
     }
 };
@@ -518,10 +524,13 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
     std::mt19937 rng{ 42u };
     auto inits = generate_inits(cfg.init_biscuit, cfg.n_starts, rng);
 
-    std::atomic<int> done{ 0 };
-    std::atomic<bool> producer_finished{ false };
+    // 서로 다른 수명/접근 빈도를 가진 원자 변수의 false sharing 방지.
+    alignas(64) std::atomic<int> done{ 0 };
+    alignas(64) std::atomic<bool> producer_finished{ false };
+    alignas(64) std::atomic<bool> io_failed{ false };
 
-    LockFreeMPSCQueue<Record, 65536> queue;
+    // The 65,536-cell queue occupies about 8 MiB; keep it off the thread stack.
+    auto queue = std::make_unique<LockFreeMPSCQueue<Record, 65536>>();
 
     auto t0 = std::chrono::steady_clock::now();
 
@@ -529,6 +538,7 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
         std::ofstream f(cfg.output_path, std::ios::app);
         if (!f.is_open()) {
             std::cerr << "[Error] 출력 파일 오픈 실패: " << cfg.output_path << std::endl;
+            io_failed.store(true, std::memory_order_release);
             return;
         }
 
@@ -552,7 +562,7 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
 
         Record rec;
         while (true) {
-            if (queue.pop(rec)) {
+            if (queue->pop(rec)) {
                 write_buffer.push_back(rec);
                 if (write_buffer.size() >= 1000) {
                     flush_buffer(write_buffer);
@@ -560,7 +570,7 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
                 }
             } else {
                 if (producer_finished.load(std::memory_order_acquire)) {
-                    if (!queue.pop(rec)) {
+                    if (!queue->pop(rec)) {
                         break;
                     }
                     write_buffer.push_back(rec);
@@ -582,9 +592,12 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
 
         workers.emplace_back([&, start_idx, end_idx]() {
             std::vector<Node> local_node_pool;
-            local_node_pool.reserve(2000000);
+            // run(n_sim)은 simulation당 최대 1개 노드만 확장한다.
+            // 따라서 트리의 최대 노드 수는 root 1개 + n_sim개다.
+            local_node_pool.reserve(static_cast<size_t>(cfg.n_sim) + 1);
 
             for (int i = start_idx; i < end_idx; ++i) {
+                if (io_failed.load(std::memory_order_acquire)) break;
                 if (completed_ids.find(i) != completed_ids.end()) {
                     ++done;
                     continue;
@@ -602,7 +615,8 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
                         r.resource_tier = cfg.resource_tier;
                         r.biscuit_id = i;
                         
-                        while (!queue.push(r)) {
+                        while (!queue->push(r)) {
+                            if (io_failed.load(std::memory_order_acquire)) return;
                             std::this_thread::yield();
                         }
                     }
