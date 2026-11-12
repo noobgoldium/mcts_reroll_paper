@@ -1,98 +1,135 @@
 name: MCTS Massive Simulation
 
+# 사용법: Actions 탭 → Run workflow → tier 선택 (0~4)
+#  - tier 하나당 goals(10) × chunks(10) = 100개 job 이 병렬 실행됨 (matrix 한도 256 이내)
+#  - 무료 플랜 동시 실행 한도(20 job)를 넘는 job 은 자동으로 대기열에 들어감
+#  - 6시간 제한에 걸린 chunk 는 CSV 를 artifact 로 저장한 뒤 스스로 재실행(이어하기)함
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *' # 크론은 백업용으로만 유지
-  repository_dispatch:
-    types: [next_chunk] # 다음 청크를 안전하게 이어받는 트리거
+    inputs:
+      tier:
+        description: "자원 티어 (0~4)"
+        required: true
+        default: "4"
+      goals:
+        description: "실행할 goal id (쉼표 구분)"
+        required: true
+        default: "0,1,2,3,4,5,6,7,8,9"
+      chunks:
+        description: "실행할 chunk id (쉼표 구분)"
+        required: true
+        default: "0,1,2,3,4,5,6,7,8,9"
+      chunk_size:
+        description: "chunk 당 biscuit 수 (chunk c = id [c*size, (c+1)*size))"
+        required: true
+        default: "10000"
 
-concurrency:
-  group: mcts-simulation
-  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: write   # 6시간 도달 시 self re-dispatch + artifact 조회
 
 jobs:
-  build-and-run:
+  plan:
     runs-on: ubuntu-24.04
-    
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - name: Build matrix
+        id: mk
+        env:
+          TIER: ${{ inputs.tier }}
+          GOALS: ${{ inputs.goals }}
+          CHUNKS: ${{ inputs.chunks }}
+          CHUNK_SIZE: ${{ inputs.chunk_size }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          tier = int(os.environ["TIER"])
+          assert 0 <= tier <= 4, "tier must be 0..4"
+          assert int(os.environ["CHUNK_SIZE"]) > 0
+          goals = [int(x) for x in os.environ["GOALS"].split(",") if x.strip()]
+          chunks = [int(x) for x in os.environ["CHUNKS"].split(",") if x.strip()]
+          assert all(0 <= g <= 9 for g in goals), "goal must be 0..9"
+          inc = [{"goal": g, "chunk": c} for g in goals for c in chunks]
+          assert 0 < len(inc) <= 256, "matrix size must be 1..256"
+          print("matrix=" + json.dumps({"include": inc}))
+          PY
+
+  mcts:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355            # 하드 한도(360분) 직전 안전망
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    # 같은 (tier, goal, chunk) 는 동시에 하나만. 재디스패치된 run 은 현재 job 이 끝날 때까지 대기.
+    concurrency:
+      group: mcts-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
+      cancel-in-progress: false
+    env:
+      TIER: ${{ inputs.tier }}
+      GOAL: ${{ matrix.goal }}
+      CHUNK: ${{ matrix.chunk }}
+      CHUNK_SIZE: ${{ inputs.chunk_size }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ARTIFACT_NAME: mcts-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # 💡 동시 실행 방지 안전장치 (동시 실행 시 1초 만에 자동 종료)
-      - name: Check for concurrent runs
-        uses: softprops/turnstyle@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          same-branch-only: true
-          abort-after-seconds: 1
-
-      - name: Setup Git User
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Build MCTS Engine
         run: |
           g++-14 -O3 -march=native -flto -funroll-loops -pipe -std=c++26 -pthread mcts_engine.cpp -o mcts_engine
 
-      - name: Run MCTS Engine with Soft Timeout & Auto-Commit
+      # 이전 6시간 구간에서 저장한 partial CSV 가 있으면 내려받아 이어서 진행
+      - name: Restore previous progress (artifact)
         run: |
-          # 1. MCTS 엔진 백그라운드 실행
-          ./mcts_engine &
-          ENGINE_PID=$!
-          
-          # 2. 5분마다 자동 저장 루프
-          (
-            while kill -0 $ENGINE_PID 2>/dev/null; do
-              sleep 300
-              if ! kill -0 $ENGINE_PID 2>/dev/null; then break; fi
-              
-              if git status --porcelain | grep -q "biscuit_tier_.*\.csv"; then
-                git pull --rebase origin main || true
-                git add biscuit_tier_*.csv
-                git commit -m "Auto-save MCTS chunk progress [skip ci]"
-                git push origin main || true
-              fi
-            done
-          ) &
-          LOOP_PID=$!
-          
-          # 3. 💡 5시간 40분 소프트 타임아웃 설정
-          (
-            sleep 20400
-            if kill -0 $ENGINE_PID 2>/dev/null; then
-              echo "⚠️ 5시간 40분 도달. 엔진을 강제 종료(SIGKILL)합니다."
-              kill -9 $ENGINE_PID 2>/dev/null
-            fi
-          ) &
-          TIMEOUT_PID=$!
-          
-          # 4. 엔진 종료 대기
-          wait $ENGINE_PID || true
-          
-          # 5. 타이머 및 백그라운드 루프 종료
-          kill $LOOP_PID $TIMEOUT_PID 2>/dev/null || true
-          
-          # 6. 강제 종료 직전까지 쌓인 최종 데이터 마감 푸시
-          echo "Engine finished or stopped. Starting final push..."
-          git pull --rebase origin main || true
-          if git status --porcelain | grep -q "biscuit_tier_.*\.csv"; then
-            git add biscuit_tier_*.csv
-            git commit -m "Final MCTS results push [skip ci]"
-            git push -f origin main || true
+          mkdir -p out
+          ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id // empty')
+          if [ -n "$ID" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ID}/zip" > /tmp/prev.zip
+            unzip -o /tmp/prev.zip -d out
+            echo "restored artifact ${ARTIFACT_NAME} (id=${ID})"
+            wc -l out/*.csv || true
+          else
+            echo "no previous artifact: starting fresh"
           fi
 
-      # 💡 API 주소, 달러($) 기호, C++26 버전까지 모두 마감된 웨이크업 스텝
-      - name: 🔄 Trigger Next Chunk (Self-Wakeup)
-        if: always()
+      - name: Run MCTS Engine (335min soft limit)
+        id: run
         run: |
-          echo "🚀 모든 데이터 저장이 완료되었습니다. 다음 청크를 안전하게 호출합니다."
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
-            -d '{"event_type": "next_chunk"}'
+          ID_START=$(( CHUNK * CHUNK_SIZE ))
+          ID_END=$(( (CHUNK + 1) * CHUNK_SIZE ))
+          set +e
+          ./mcts_engine \
+            --tier "$TIER" --goal "$GOAL" \
+            --id_start "$ID_START" --id_end "$ID_END" \
+            --time_limit_min 335 \
+            --out "out/biscuit_tier_${TIER}_goal_${GOAL}_chunk_${CHUNK}.csv"
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "engine exit code: $rc"
+          # 0 = 완료, 75 = 시간제한(이어하기 필요), 그 외 = 실패
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 75 ]; then exit "$rc"; fi
+
+      # 완료/미완료 모두 저장 (같은 이름으로 덮어쓰기 → 다음 구간이 항상 최신본을 받음)
+      - name: Upload CSV artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: out/*.csv
+          overwrite: true
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # 6시간 한도에 걸려 미완료면 같은 chunk 만 다시 디스패치
+      - name: Re-dispatch remaining work
+        if: steps.run.outputs.rc == '75'
+        run: |
+          echo "미완료 → tier=$TIER goal=$GOAL chunk=$CHUNK 이어하기 디스패치"
+          gh workflow run "$GITHUB_WORKFLOW" --ref "$GITHUB_REF_NAME" \
+            -f tier="$TIER" -f goals="$GOAL" -f chunks="$CHUNK" -f chunk_size="$CHUNK_SIZE"
