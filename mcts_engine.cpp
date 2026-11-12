@@ -1,12 +1,23 @@
 /**
- * mcts_engine.cpp — 동작 보존형 최적화 버전
- * RNG, RNG 호출 순서, MCTS 정책, 게임 규칙 및 CSV 스키마는 변경하지 않는다.
+ * mcts_engine.cpp — 동작 보존형 최적화 버전 (Actions 분산 실행 대응)
+ *
+ * [변경 없음] RNG, MCTS 정책(select/expand/rollout/backprop), 보상 함수, 게임 규칙, CSV 스키마
+ * [변경] main/pipeline/IO 계층만:
+ *   - CLI: --tier --goal --id_start --id_end --out --time_limit_min --n_starts --n_sim
+ *   - 워커 수 = hardware_concurrency, 정적 분할 → 원자 카운터 기반 동적 분배
+ *   - 시간제한/SIGINT/SIGTERM 시 현재 비스킷까지 끝내고 안전 종료 (exit code 75 = 미완료)
+ *   - IO 스레드 busy-yield → sleep (코어 1개 낭비 제거), 10초 주기 flush
+ *   - 재개 시 잘린 CSV 꼬리줄 복구
  */
 #include <mutex>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -294,7 +305,7 @@ struct MCTSTree {
         int bg = nodes[idx].bg;
         int bl = nodes[idx].bl;
         bool success = false;
-        
+
         // Goal의 요구 슬롯 수는 롤아웃 동안 변하지 않으므로 한 번만 계산한다.
         int total_required = 0;
         for (const auto& g : goal) total_required += g.required;
@@ -404,7 +415,7 @@ private:
     };
 
     Cell buffer[Capacity];
-    
+
     // pop()은 I/O 스레드 하나만 호출한다. 소비자 전용 head는 비원자 변수로 둔다.
     // 여러 Worker가 공유하는 tail은 원자성을 유지한다.
     size_t head = 0;
@@ -429,7 +440,7 @@ public:
                     break;
                 }
             } else if (diff < 0) {
-                return false; 
+                return false;
             } else {
                 t = tail.load(std::memory_order_relaxed);
             }
@@ -453,6 +464,10 @@ public:
     }
 };
 
+// ══════════════════════════════════════════════════════════
+//  이하 실행/분산/IO 계층 (MCTS 시뮬 로직과 무관)
+// ══════════════════════════════════════════════════════════
+
 // ── CSV 헤더 ──────────────────────────────────────────────
 static const std::string CSV_HEADER =
 "tier_0,tier_1,tier_2,tier_3,tier_4,progress,budget_g,budget_l,"
@@ -460,6 +475,40 @@ static const std::string CSV_HEADER =
 "opt6_tier,opt7_tier,opt8_tier,opt9_tier,opt10_tier,opt11_tier,"
 "best_action,best_q,q_general,q_light_avg,"
 "goal_id,resource_tier,biscuit_id,matched_at_switch,bl_remaining_at_switch\n";
+
+static constexpr size_t CSV_NCOLS = 29;          // 헤더 컬럼 수
+static constexpr int EXIT_INCOMPLETE = 75;       // 시간제한/중단으로 미완료 → 재개 필요
+
+// 종료 요청 플래그 (SIGINT/SIGTERM 핸들러에서 설정)
+static std::atomic<bool> g_stop{ false };
+static_assert(std::atomic<bool>::is_always_lock_free, "signal handler requires lock-free atomic");
+extern "C" void on_signal(int) { g_stop.store(true, std::memory_order_relaxed); }
+
+// 강제 종료로 마지막 줄이 잘렸다면 (개행 없이 끝남) 그 줄만 잘라낸다.
+void repair_csv_tail(const std::string& path) {
+    std::streamoff keep = -1;
+    {
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f.good()) return;
+        std::streamoff size = f.tellg();
+        if (size <= 0) return;
+        char c = 0;
+        f.seekg(size - 1); f.get(c);
+        if (c == '\n') return;
+        std::streamoff pos = size - 1;
+        keep = 0;
+        while (pos > 0) {
+            --pos;
+            f.seekg(pos); f.get(c);
+            if (c == '\n') { keep = pos + 1; break; }
+        }
+    }
+    if (keep >= 0) {
+        std::error_code ec;
+        std::filesystem::resize_file(path, static_cast<std::uintmax_t>(keep), ec);
+        std::cout << "[Repair] 잘린 마지막 줄 제거: " << path << std::endl;
+    }
+}
 
 std::unordered_set<int> get_completed_biscuit_ids(const std::string& path) {
     std::unordered_set<int> completed;
@@ -473,9 +522,9 @@ std::unordered_set<int> get_completed_biscuit_ids(const std::string& path) {
         std::string tok;
         std::vector<std::string> cols;
         while (std::getline(ss, tok, ',')) cols.push_back(tok);
-        if (cols.size() >= 3) {
+        if (cols.size() == CSV_NCOLS) {
             try {
-                completed.insert(std::stoi(cols[cols.size() - 3]));
+                completed.insert(std::stoi(cols[CSV_NCOLS - 3]));   // biscuit_id
             } catch (...) {}
         }
     }
@@ -517,15 +566,24 @@ struct MCTSConfig {
     int max_rollout = 300;
     int goal_id = 0;
     int resource_tier = 0;
+    int id_start = 0;      // 처리할 biscuit_id 범위 [id_start, id_end)
+    int id_end = 100000;
     std::string output_path = "";
 };
 
-void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& completed_ids) {
+// 반환: 0 = 범위 전체 완료, EXIT_INCOMPLETE = 중단(재개 필요), 1 = I/O 오류
+int run_mcts_pipeline(const MCTSConfig& cfg,
+    const std::unordered_set<int>& completed_ids,
+    std::chrono::steady_clock::time_point deadline)
+{
     std::mt19937 rng{ 42u };
     auto inits = generate_inits(cfg.init_biscuit, cfg.n_starts, rng);
 
+    const int total = cfg.id_end - cfg.id_start;
+
     // 서로 다른 수명/접근 빈도를 가진 원자 변수의 false sharing 방지.
     alignas(64) std::atomic<int> done{ 0 };
+    alignas(64) std::atomic<int> next_id{ cfg.id_start };
     alignas(64) std::atomic<bool> producer_finished{ false };
     alignas(64) std::atomic<bool> io_failed{ false };
 
@@ -560,6 +618,7 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
             f.flush();
         };
 
+        auto last_flush = std::chrono::steady_clock::now();
         Record rec;
         while (true) {
             if (queue->pop(rec)) {
@@ -567,6 +626,7 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
                 if (write_buffer.size() >= 1000) {
                     flush_buffer(write_buffer);
                     write_buffer.clear();
+                    last_flush = std::chrono::steady_clock::now();
                 }
             } else {
                 if (producer_finished.load(std::memory_order_acquire)) {
@@ -575,29 +635,41 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
                     }
                     write_buffer.push_back(rec);
                 } else {
-                    std::this_thread::yield();
+                    // 큐가 비었을 때 busy-yield 대신 sleep: 워커에게 코어를 양보한다.
+                    auto now = std::chrono::steady_clock::now();
+                    if (!write_buffer.empty() &&
+                        now - last_flush >= std::chrono::seconds(10)) {
+                        flush_buffer(write_buffer);
+                        write_buffer.clear();
+                        last_flush = now;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
             }
         }
         flush_buffer(write_buffer);
     });
 
-    const unsigned int num_threads = 2;
+    const unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency());
+    const int progress_step = std::max(1, total / 20);
     std::vector<std::thread> workers;
-    int chunk_size = cfg.n_starts / num_threads;
 
     for (unsigned int t = 0; t < num_threads; ++t) {
-        int start_idx = static_cast<int>(t) * chunk_size;
-        int end_idx = (t == num_threads - 1) ? cfg.n_starts : (static_cast<int>(t) + 1) * chunk_size;
-
-        workers.emplace_back([&, start_idx, end_idx]() {
+        workers.emplace_back([&]() {
             std::vector<Node> local_node_pool;
             // run(n_sim)은 simulation당 최대 1개 노드만 확장한다.
             // 따라서 트리의 최대 노드 수는 root 1개 + n_sim개다.
             local_node_pool.reserve(static_cast<size_t>(cfg.n_sim) + 1);
 
-            for (int i = start_idx; i < end_idx; ++i) {
+            while (true) {
                 if (io_failed.load(std::memory_order_acquire)) break;
+                // 시간제한/종료 신호: 새 비스킷을 시작하지 않는다 (진행 중인 비스킷은 끝까지 기록)
+                if (g_stop.load(std::memory_order_relaxed) ||
+                    std::chrono::steady_clock::now() >= deadline) break;
+
+                int i = next_id.fetch_add(1, std::memory_order_relaxed);
+                if (i >= cfg.id_end) break;
+
                 if (completed_ids.find(i) != completed_ids.end()) {
                     ++done;
                     continue;
@@ -614,7 +686,7 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
                         r.goal_id = cfg.goal_id;
                         r.resource_tier = cfg.resource_tier;
                         r.biscuit_id = i;
-                        
+
                         while (!queue->push(r)) {
                             if (io_failed.load(std::memory_order_acquire)) return;
                             std::this_thread::yield();
@@ -623,8 +695,12 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
                 }
 
                 int cnt = ++done;
-                if (cnt % 10000 == 0)
-                    std::cout << "  " << cnt << "/" << cfg.n_starts << std::endl;
+                if (cnt % progress_step == 0) {
+                    double el = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    std::cout << "  " << cnt << "/" << total
+                              << " (" << static_cast<long long>(el) << "s)" << std::endl;
+                }
             }
         });
     }
@@ -636,12 +712,29 @@ void run_mcts_pipeline(const MCTSConfig& cfg, const std::unordered_set<int>& com
 
     double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
-    std::cout << "\n[MCTS] 탐색 완료: " << elapsed << "초\n";
+    std::cout << "\n[MCTS] 탐색 종료: " << elapsed << "초 (" << done.load() << "/" << total << ")\n";
+
+    if (io_failed.load()) return 1;
+    return (done.load() >= total) ? 0 : EXIT_INCOMPLETE;
+}
+
+static void print_usage() {
+    std::cerr <<
+        "사용법: mcts_engine [옵션]\n"
+        "  --tier T            자원 티어 0~4 (생략 시 전체)\n"
+        "  --goal G            목표 0~9    (생략 시 전체)\n"
+        "  --id_start S        biscuit_id 시작 (기본 0)\n"
+        "  --id_end E          biscuit_id 끝, 미포함 (기본 n_starts)\n"
+        "  --out PATH          출력 CSV (--tier/--goal 둘 다 지정 시에만 사용)\n"
+        "  --time_limit_min M  M분 후 안전 종료, exit code 75 (기본 무제한)\n"
+        "  --n_starts N        기본 100000\n"
+        "  --n_sim N           기본 500\n";
 }
 
 int main(int argc, char* argv[]) {
-    (void)argc; (void)argv;
     build_opt_vals();
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
 
     const std::vector<Goal> GOALS = {
         { { 5,4,5 } },
@@ -665,10 +758,70 @@ int main(int argc, char* argv[]) {
         { 103333, 388, 4 },
     };
 
+    // ── CLI 파싱 ──
+    int tier_filter = -1, goal_filter = -1;
+    int id_start = 0, id_end = -1;
+    int n_starts = 100000, n_sim = 500;
+    double time_limit_min = 0.0;
+    std::string out_path;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto need = [&]() -> const char* {
+            if (i + 1 >= argc) {
+                std::cerr << "[Error] 값이 필요합니다: " << a << "\n";
+                print_usage();
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+        try {
+            if (a == "--tier")                tier_filter = std::stoi(need());
+            else if (a == "--goal")           goal_filter = std::stoi(need());
+            else if (a == "--id_start")       id_start = std::stoi(need());
+            else if (a == "--id_end")         id_end = std::stoi(need());
+            else if (a == "--out")            out_path = need();
+            else if (a == "--time_limit_min") time_limit_min = std::stod(need());
+            else if (a == "--n_starts")       n_starts = std::stoi(need());
+            else if (a == "--n_sim")          n_sim = std::stoi(need());
+            else { std::cerr << "[Error] 알 수 없는 인자: " << a << "\n"; print_usage(); return 2; }
+        } catch (const std::exception&) {
+            std::cerr << "[Error] 잘못된 값: " << a << "\n";
+            return 2;
+        }
+    }
+
+    if (id_end < 0 || id_end > n_starts) id_end = n_starts;
+    if (id_start < 0 || id_start >= id_end) {
+        std::cerr << "[Error] 잘못된 id 범위: [" << id_start << ", " << id_end << ")\n";
+        return 2;
+    }
+    if (tier_filter >= static_cast<int>(TIERS.size()) || goal_filter >= static_cast<int>(GOALS.size())) {
+        std::cerr << "[Error] tier/goal 범위 초과\n";
+        return 2;
+    }
+    if (!out_path.empty() && (tier_filter < 0 || goal_filter < 0)) {
+        std::cerr << "[Error] --out은 --tier와 --goal을 함께 지정해야 합니다.\n";
+        return 2;
+    }
+
+    const auto deadline = (time_limit_min > 0.0)
+        ? std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double, std::ratio<60>>(time_limit_min))
+        : std::chrono::steady_clock::time_point::max();
+
+    std::cout << "[Info] threads=" << std::max(1u, std::thread::hardware_concurrency())
+              << " id_range=[" << id_start << "," << id_end << ")"
+              << " n_sim=" << n_sim << std::endl;
+
     for (int ti = 0; ti < (int)TIERS.size(); ++ti) {
+        if (tier_filter >= 0 && ti != tier_filter) continue;
         for (int gi = 0; gi < (int)GOALS.size(); ++gi) {
-            std::string filename = "biscuit_tier_" + std::to_string(ti)
-                + "_goal_" + std::to_string(gi) + ".csv";
+            if (goal_filter >= 0 && gi != goal_filter) continue;
+
+            std::string filename = !out_path.empty() ? out_path
+                : "biscuit_tier_" + std::to_string(ti) + "_goal_" + std::to_string(gi) + ".csv";
 
             MCTSConfig cfg;
             cfg.goal = GOALS[gi];
@@ -677,30 +830,49 @@ int main(int argc, char* argv[]) {
             cfg.budget_g = TIERS[ti].bg;
             cfg.budget_l = TIERS[ti].bl;
             cfg.max_rollout = TIERS[ti].bg + TIERS[ti].bl;
-            cfg.n_starts = 100000;
-            cfg.n_sim = 500;
+            cfg.n_starts = n_starts;
+            cfg.n_sim = n_sim;
+            cfg.id_start = id_start;
+            cfg.id_end = id_end;
             cfg.output_path = filename;
 
-            std::unordered_set<int> completed_ids = get_completed_biscuit_ids(filename);
-            int total_completed = static_cast<int>(completed_ids.size());
+            auto parent = std::filesystem::path(filename).parent_path();
+            if (!parent.empty()) {
+                std::error_code ec;
+                std::filesystem::create_directories(parent, ec);
+            }
 
-            if (total_completed >= cfg.n_starts) {
-                std::cout << "\n[Skip] 완료된 청크: " << filename << " (" << total_completed << "/" << cfg.n_starts << ")\n";
+            repair_csv_tail(filename);
+            std::unordered_set<int> completed_ids = get_completed_biscuit_ids(filename);
+
+            int done_in_range = 0;
+            for (int id : completed_ids)
+                if (id >= id_start && id < id_end) ++done_in_range;
+            const int range = id_end - id_start;
+
+            if (done_in_range >= range) {
+                std::cout << "\n[Skip] 완료된 청크: " << filename
+                          << " (" << done_in_range << "/" << range << ")\n";
                 continue;
             }
 
-            if (total_completed == 0) {
+            if (completed_ids.empty()) {
                 std::ofstream hdr(filename);
                 hdr << CSV_HEADER;
                 std::cout << "\n[New ] " << filename << " 생성\n";
             }
             else {
                 std::cout << "\n[Resume] " << filename
-                    << " (이미 완료된 항목: " << total_completed << "개, 빠진 구간 메우기 시작)\n";
+                    << " (범위 내 완료: " << done_in_range << "/" << range << ", 나머지 이어서 진행)\n";
             }
 
-            std::cout << "[Tier " << ti << " Goal " << gi << " 시작]\n";
-            run_mcts_pipeline(cfg, completed_ids);
+            std::cout << "[Tier " << ti << " Goal " << gi << " 시작]" << std::endl;
+            int status = run_mcts_pipeline(cfg, completed_ids, deadline);
+            if (status != 0) {
+                if (status == EXIT_INCOMPLETE)
+                    std::cout << "[Stop] 시간제한/종료 신호 → 미완료 (exit " << status << ")\n";
+                return status;
+            }
         }
     }
 
