@@ -644,7 +644,7 @@ struct Q1PolicyResult {
     int policy = 0;
     int switch_matched = -1;
     int switch_bl_remaining = -1;
-    int switch_reason = 0; // 0=threshold, 1=forced by general-dough exhaustion
+    int switch_reason = -1; // -1=no switch, 0=threshold, 1=forced by general-dough exhaustion
     int achieved = 0;
     int terminal_reason = 0; // 1=goal, 2=no legal action, 3=no unmatched slot
     int bg_spent = 0, bl_spent = 0, steps = 0;
@@ -756,7 +756,7 @@ int run_q1_compare(
         std::cerr << "[Error] Q1 출력 파일 생성 실패: " << output_path << "\n";
         return 1;
     }
-    out << "goal_id,resource_tier,biscuit_id,base_seed,policy,initial_matched,"
+    out << "goal_id,resource_tier,biscuit_id,initial_seed,policy_seed,policy,initial_matched,"
            "switch_threshold,switch_matched,switch_bl_remaining,switch_reason,"
            "goal_achieved,terminal_reason,bg_initial,bl_initial,bg_spent,bl_spent,"
            "bg_remaining,bl_remaining,reroll_steps,initial_score,final_score,"
@@ -812,8 +812,12 @@ int run_q1_compare(
             const int threshold = policy_index + 1;
             const auto& r = results[static_cast<size_t>(local)]
                                     [static_cast<size_t>(policy_index)];
+            const uint64_t policy_seed = mix_seed(
+                base_seed ^ static_cast<uint64_t>(id) ^
+                (threshold == 1 ? 0x513141ULL : 0x513142ULL));
             out << goal_id << ',' << resource_tier << ',' << id << ','
-                << init_seed << ',' << (threshold == 1 ? "Q1-A" : "Q1-B") << ','
+                << init_seed << ',' << policy_seed << ','
+                << (threshold == 1 ? "Q1-A" : "Q1-B") << ','
                 << initial_matched << ',' << threshold << ','
                 << r.switch_matched << ',' << r.switch_bl_remaining << ','
                 << r.switch_reason << ',' << r.achieved << ','
