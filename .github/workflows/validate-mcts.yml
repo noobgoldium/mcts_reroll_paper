@@ -1,0 +1,53 @@
+name: Validate MCTS STOP engine
+
+on:
+  push:
+    branches:
+      - fix/mcts-constraints-and-records
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  compile-and-smoke-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GCC 14
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14
+
+      - name: Compile C++26 engine
+        run: |
+          g++-14 -O2 -std=c++26 -pthread -Wall -Wextra -Wpedantic mcts_engine.cpp -o mcts_engine
+
+      - name: Run small simulation
+        run: |
+          mkdir -p out
+          ./mcts_engine --tier 0 --goal 0 --n_starts 2 --n_sim 100 --id_start 0 --id_end 2 --out out/smoke.csv
+
+      - name: Validate new CSV schema and terminal records
+        run: |
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+
+          path = Path("out/smoke.csv")
+          with path.open(newline="") as f:
+              rows = list(csv.DictReader(f))
+
+          assert rows, "simulation produced no decision records"
+          required = {
+              "q_stop", "q_continue", "biscuit_score", "matched_count",
+              "goal_achieved", "bg_spent", "bl_spent", "decision_step",
+              "terminal_reason",
+          }
+          assert required.issubset(rows[0].keys()), "missing STOP-analysis columns"
+          assert all(int(row["best_action"]) in {-1, 0, 1, 2, 3, 4, 5} for row in rows)
+          assert all(int(row["terminal_reason"]) in {0, 1, 2} for row in rows)
+          assert any(int(row["terminal_reason"]) in {1, 2} for row in rows), "no terminal episode record"
+          print(f"validated {len(rows)} state/terminal rows")
+          PY
