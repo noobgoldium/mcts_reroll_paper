@@ -612,25 +612,27 @@ static std::atomic<bool> g_stop{ false };
 static_assert(std::atomic<bool>::is_always_lock_free, "signal handler requires lock-free atomic");
 extern "C" void on_signal(int) { g_stop.store(true, std::memory_order_relaxed); }
 
-std::vector<Biscuit> generate_inits(const Biscuit& base, int n, bool has_attribute_damage, uint64_t base_seed) {
-    std::vector<Biscuit> inits(n);
-    for (int i = 0; i < n; ++i) {
-        tl_rng.reseed(mix_seed(base_seed ^ static_cast<uint64_t>(i) ^ 0x494E495449414CULL));
-        if (i % 3 == 0) {
+std::vector<Biscuit> generate_inits(const Biscuit& base, int id_start, int id_end,
+    bool has_attribute_damage, uint64_t base_seed) {
+    std::vector<Biscuit> inits(static_cast<size_t>(id_end - id_start));
+    for (int local = 0; local < id_end - id_start; ++local) {
+        const int id = id_start + local;
+        tl_rng.reseed(mix_seed(base_seed ^ static_cast<uint64_t>(id) ^ 0x494E495449414CULL));
+        if (id % 3 == 0) {
             for (int p = 0; p < 4; ++p) {
                 int opt = tl_rng.next_int(has_attribute_damage ? N_OPTS : N_OPTS - 1);
                 int vidx = tl_rng.next_int(OPT_SIZES[opt]);
-                inits[i][p] = { opt, OPT_VALS[opt][vidx] };
+                inits[static_cast<size_t>(local)][p] = { opt, OPT_VALS[opt][vidx] };
             }
         }
         else {
-            inits[i] = base;
+            inits[static_cast<size_t>(local)] = base;
             int nr = tl_rng.next_int(3);
             for (int j = 0; j < nr; ++j) {
                 int pos = tl_rng.next_int(4);
                 int opt = tl_rng.next_int(has_attribute_damage ? N_OPTS : N_OPTS - 1);
                 int vidx = tl_rng.next_int(OPT_SIZES[opt]);
-                inits[i][pos] = { opt, OPT_VALS[opt][vidx] };
+                inits[static_cast<size_t>(local)][pos] = { opt, OPT_VALS[opt][vidx] };
             }
         }
     }
@@ -658,7 +660,8 @@ int run_mcts_pipeline(const MCTSConfig& cfg)
 {
     const bool has_attribute_damage = std::any_of(cfg.goal.begin(), cfg.goal.end(),
         [](const GoalEntry& entry) { return entry.opt_idx == 11; });
-    auto inits = generate_inits(cfg.init_biscuit, cfg.n_starts, has_attribute_damage, cfg.seed);
+    auto inits = generate_inits(cfg.init_biscuit, cfg.id_start, cfg.id_end,
+        has_attribute_damage, cfg.seed);
 
     const int total = cfg.id_end - cfg.id_start;
 
@@ -762,7 +765,7 @@ int run_mcts_pipeline(const MCTSConfig& cfg)
                 local_node_pool.clear();
                 const uint64_t biscuit_seed = mix_seed(cfg.seed ^ static_cast<uint64_t>(i) ^ 0x534541524348ULL);
                 tl_rng.reseed(biscuit_seed);
-                MCTSTree tree(local_node_pool, inits[i],
+                MCTSTree tree(local_node_pool, inits[static_cast<size_t>(i - cfg.id_start)],
                     cfg.budget_g, cfg.budget_l, cfg.goal, cfg.max_rollout);
                 tree.run(cfg.n_sim);
 
