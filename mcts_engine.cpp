@@ -186,7 +186,8 @@ static constexpr int ACTION_STOP = 5;
 static constexpr int N_ACTIONS = 6;
 
 // 행동 제약은 트리 탐색과 롤아웃에서 공유한다.
-// 매칭 슬롯이 생기면 일반도우를 금지하고, 빛도우는 미매칭 슬롯에만 사용한다.
+// 매칭 0~1개: 일반도우 허용, 매칭 2개 이상: 일반도우 금지.
+// 빛도우는 매칭되지 않은 슬롯에만 사용한다.
 inline int count_matched_slots(const std::array<bool, 4>& matched) {
     int count = 0;
     for (bool m : matched) if (m) ++count;
@@ -203,7 +204,7 @@ inline bool is_action_legal(
 
     if (action == ACTION_STOP) return true;
     if (action == ACTION_GENERAL)
-        return bg >= 1 && matched_count == 0;
+        return bg >= 1 && matched_count < 2;
     const int pos = action - ACTION_LIGHT_FIRST;
     return bl >= 1 && pos >= 0 && pos < 4 &&
         matched_count > 0 && !matched[static_cast<size_t>(pos)];
@@ -325,7 +326,6 @@ struct MCTSTree {
         int bg = nodes[idx].bg;
         int bl = nodes[idx].bl;
         for (int step = 0; step < max_rollout; ++step) {
-            const int matched_count = count_matched_slots(get_matched_slots(b, goal));
             std::array<int, 4> legal{};
             int legal_count = 0;
             if (is_action_legal(b, bg, bl, goal, ACTION_GENERAL))
