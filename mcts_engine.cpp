@@ -204,37 +204,31 @@ inline bool is_action_legal(
         matched_count > 0 && !matched[static_cast<size_t>(pos)];
 }
 
+// Open-loop MCTS: 노드는 고정된 비스킷 상태가 아니라 행동 이력을 나타낸다.
+// 확률적 행동을 선택할 때마다 현재 표본 상태에 새 리롤 결과를 적용한다.
+// 따라서 한 행동 간선의 Q는 해당 행동 이력 아래 여러 전이 결과의 평균이다.
 struct Node {
-    Biscuit biscuit{};
-    int bg = 0, bl = 0, parent = -1, action = -1;
     std::array<int, N_ACTIONS> children{ -1,-1,-1,-1,-1,-1 };
-    std::array<bool, N_ACTIONS> untried{ true,true,true,true,true,true };
     float value = 0.0f;
     int visits = 0;
-    bool stopped = false;
-    bool is_terminal(const Goal& goal) const {
-        if (stopped) return true;
-        if (is_action_legal(biscuit, bg, bl, goal, ACTION_GENERAL)) return false;
-        for (int a = ACTION_LIGHT_FIRST; a <= ACTION_LIGHT_LAST; ++a)
-            if (is_action_legal(biscuit, bg, bl, goal, a)) return false;
-        return true;
-    }
+    int parent = -1;
+    int action = -1;
 };
 
 struct Record {
-    std::array<int, 5>  tier_counts{};
+    std::array<int, 5> tier_counts{};
     std::array<int, 12> opt_max_tier{};
-    float progress = 0.0f, best_q = 0.0f, q_general = 0.0f, q_light_avg = 0.0f;
+    float progress = 0.0f, best_q = 0.0f, q_general = -1.0f, q_light_avg = -1.0f;
     int bg = 0, bl = 0, best_action = -1;
     int goal_id = -1;
     int resource_tier = -1;
     int biscuit_id = -1;
     int matched_at_switch = -1;
     int bl_remaining_at_switch = -1;
-    float q_stop = 0.0f, q_continue = 0.0f, score = 0.0f;
+    float q_stop = -1.0f, q_continue = -1.0f, score = 0.0f;
     int matched_count = 0, goal_achieved = 0;
     int bg_spent = 0, bl_spent = 0, decision_step = 0;
-    int terminal_reason = 0; // 0=decision, 1=voluntary stop, 2=resource exhausted
+    int terminal_reason = 0; // 0=decision, 1=voluntary stop, 2=no legal continuation
 };
 
 struct MCTSTree {
@@ -243,98 +237,52 @@ struct MCTSTree {
     int max_rollout;
     int initial_bg, initial_bl;
     bool has_attribute_damage;
+    Biscuit initial_biscuit;
 
     MCTSTree(std::vector<Node>& pool, const Biscuit& init,
         int bg, int bl, const Goal& g, int mr)
         : nodes(pool), goal(g), max_rollout(mr), initial_bg(bg), initial_bl(bl),
           has_attribute_damage(std::any_of(g.begin(), g.end(),
-              [](const GoalEntry& entry) { return entry.opt_idx == 11; }))
+              [](const GoalEntry& entry) { return entry.opt_idx == 11; })),
+          initial_biscuit(init)
     {
-        Node root;
-        root.biscuit = init; root.bg = bg; root.bl = bl;
-        nodes.push_back(root);
+        nodes.emplace_back(); // root = empty action history
     }
 
-    int new_node(const Biscuit& b, int bg, int bl, int par, int act) {
+    int new_node(int parent, int action) {
         Node n;
-        n.biscuit = b; n.bg = bg; n.bl = bl;
-        n.parent = par; n.action = act;
+        n.parent = parent;
+        n.action = action;
         nodes.push_back(n);
         return static_cast<int>(nodes.size()) - 1;
     }
 
-    inline float ucb1(int ni, int a, float log_parent_visits, float c = 0.707f) {
-        int ci = nodes[ni].children[a];
+    inline float ucb1(int parent, int action, float log_parent_visits,
+        float c = 0.70710678f) const
+    {
+        const int ci = nodes[parent].children[action];
         if (ci < 0) return std::numeric_limits<float>::infinity();
         const Node& child = nodes[ci];
         if (child.visits == 0) return std::numeric_limits<float>::infinity();
-        return (child.value / static_cast<float>(child.visits)) +
+        return child.value / static_cast<float>(child.visits) +
             c * std::sqrt(log_parent_visits / static_cast<float>(child.visits));
     }
 
-    int select() {
-        int idx = 0;
-        while (!nodes[idx].is_terminal(goal)) {
-            const Node& n = nodes[idx];
-            bool has_untried = false;
-            for (int a = 0; a < N_ACTIONS; ++a)
-                if (n.untried[a] &&
-                    is_action_legal(n.biscuit, n.bg, n.bl, goal, a)) {
-                    has_untried = true; break;
-                }
-            if (has_untried) return idx;
-            int best_a = -1; float best_u = -1.0f;
-            float log_p = std::log(static_cast<float>(n.visits));
-            for (int a = 0; a < N_ACTIONS; ++a) {
-                if (!is_action_legal(n.biscuit, n.bg, n.bl, goal, a)) continue;
-                float u = ucb1(idx, a, log_p);
-                if (u > best_u) { best_u = u; best_a = a; }
-            }
-            if (best_a < 0 || nodes[idx].children[best_a] < 0) return idx;
-            idx = nodes[idx].children[best_a];
+    inline void apply_action(Biscuit& b, int& bg, int& bl, int action) const {
+        if (action == ACTION_GENERAL) {
+            b = reroll_general(b, has_attribute_damage);
+            --bg;
+        } else if (action >= ACTION_LIGHT_FIRST && action <= ACTION_LIGHT_LAST) {
+            b = reroll_light(b, action - ACTION_LIGHT_FIRST, has_attribute_damage);
+            --bl;
         }
-        return idx;
     }
 
-    int expand(int idx) {
-        Node& node = nodes[idx];
-        std::array<int, N_ACTIONS> acts{};
-        int n_acts = 0;
-        for (int a = 0; a < N_ACTIONS; ++a) {
-            if (!node.untried[a]) continue;
-            if (!is_action_legal(node.biscuit, node.bg, node.bl, goal, a)) continue;
-            acts[n_acts++] = a;
-        }
-        if (n_acts == 0) return idx;
-        int a = acts[tl_rng.next_int(n_acts)];
-        node.untried[a] = false;
-        Biscuit nb = node.biscuit;
-        int new_bg = node.bg, new_bl = node.bl;
-        if (a == ACTION_GENERAL) {
-            nb = reroll_general(node.biscuit, has_attribute_damage);
-            --new_bg;
-        }
-        else if (a >= ACTION_LIGHT_FIRST && a <= ACTION_LIGHT_LAST) {
-            nb = reroll_light(node.biscuit, a - ACTION_LIGHT_FIRST, has_attribute_damage);
-            --new_bl;
-        }
-        int ci = new_node(nb, new_bg, new_bl, idx, a);
-        if (a == ACTION_STOP) nodes[ci].stopped = true;
-        nodes[idx].children[a] = ci;
-        return ci;
-    }
-
-    float rollout(int idx) {
-        Biscuit b = nodes[idx].biscuit;
-        int bg = nodes[idx].bg;
-        int bl = nodes[idx].bl;
-
-        // STOP은 terminal action이다. STOP 이후 rollout에서 상태를 변경하면 안 된다.
-        if (nodes[idx].stopped)
-            return compute_reward(b, goal);
+    float rollout(Biscuit b, int bg, int bl, bool stopped = false) const {
+        if (stopped) return compute_reward(b, goal);
 
         for (int step = 0; step < max_rollout; ++step) {
-            std::array<int, 4> legal{};
+            std::array<int, 5> legal{};
             int legal_count = 0;
             if (is_action_legal(b, bg, bl, goal, ACTION_GENERAL))
                 legal[legal_count++] = ACTION_GENERAL;
@@ -343,127 +291,180 @@ struct MCTSTree {
                     legal[legal_count++] = a;
             if (legal_count == 0) break;
 
-            // Rollout 구간에서는 합법적인 계속 행동 중 하나를 표본화한다.
-            // 자발적 STOP의 확률을 임의로 부여하지 않으며, STOP 가치는
-            // 트리의 명시적 STOP action에서만 평가한다.
-            const int a = legal[tl_rng.next_int(legal_count)];
-            if (a == ACTION_GENERAL) {
-                b = reroll_general(b, has_attribute_damage);
-                --bg;
-            }
-            else {
-                b = reroll_light(b, a - ACTION_LIGHT_FIRST, has_attribute_damage);
-                --bl;
-            }
+            // Rollout policy is deliberately documented as a random-continuation baseline.
+            const int action = legal[tl_rng.next_int(legal_count)];
+            apply_action(b, bg, bl, action);
         }
         return compute_reward(b, goal);
     }
 
-    void backprop(int idx, float r) {
-        while (idx >= 0) {
-            Node& n = nodes[idx];
-            ++n.visits; n.value += r;
-            idx = n.parent;
+    void backprop(const std::vector<int>& path, float reward) {
+        for (int idx : path) {
+            ++nodes[idx].visits;
+            nodes[idx].value += reward;
         }
     }
 
     void run(int n_sim) {
-        for (int i = 0; i < n_sim; ++i) {
-            int leaf = select();
-            if (!nodes[leaf].is_terminal(goal))
-                leaf = expand(leaf);
-            backprop(leaf, rollout(leaf));
+        for (int sim = 0; sim < n_sim; ++sim) {
+            // Every simulation starts from the same root state, but samples fresh
+            // stochastic outcomes along the selected open-loop action sequence.
+            Biscuit b = initial_biscuit;
+            int bg = initial_bg, bl = initial_bl;
+            std::vector<int> path;
+            path.reserve(64);
+            int idx = 0;
+            path.push_back(idx);
+            bool stopped = false;
+            bool expanded = false;
+
+            while (!stopped) {
+                std::array<int, N_ACTIONS> legal{};
+                int legal_count = 0;
+                for (int a = 0; a < N_ACTIONS; ++a)
+                    if (is_action_legal(b, bg, bl, goal, a))
+                        legal[legal_count++] = a;
+                if (legal_count == 0) break;
+
+                const float log_parent = std::log(
+                    static_cast<float>(std::max(1, nodes[idx].visits)));
+                float best_u = -std::numeric_limits<float>::infinity();
+                std::array<int, N_ACTIONS> ties{};
+                int tie_count = 0;
+
+                for (int k = 0; k < legal_count; ++k) {
+                    const int a = legal[k];
+                    const int ci = nodes[idx].children[a];
+                    const float u = (ci < 0)
+                        ? std::numeric_limits<float>::infinity()
+                        : ucb1(idx, a, log_parent);
+                    if (u > best_u + 1e-7f) {
+                        best_u = u;
+                        ties[0] = a;
+                        tie_count = 1;
+                    } else if (std::abs(u - best_u) <= 1e-7f) {
+                        ties[tie_count++] = a;
+                    }
+                }
+
+                const int action = ties[tl_rng.next_int(tie_count)];
+                int child = nodes[idx].children[action];
+                if (child < 0) {
+                    child = new_node(idx, action);
+                    nodes[idx].children[action] = child;
+                    expanded = true;
+                }
+
+                path.push_back(child);
+                if (action == ACTION_STOP) {
+                    stopped = true;
+                    idx = child;
+                    break;
+                }
+
+                // Crucial: do not store/replay one child biscuit. Resample this
+                // action's outcome on every traversal of this action-history node.
+                apply_action(b, bg, bl, action);
+                idx = child;
+
+                if (expanded) break;
+            }
+
+            const float reward = rollout(b, bg, bl, stopped);
+            backprop(path, reward);
+        }
+    }
+
+    void fill_state_record(Record& rec, const Biscuit& b, int bg, int bl,
+        int depth, int terminal_reason) const
+    {
+        rec.progress = goal_progress(b, goal);
+        rec.bg = bg;
+        rec.bl = bl;
+        rec.score = biscuit_score(b);
+        rec.matched_count = count_matched_slots(get_matched_slots(b, goal));
+        rec.goal_achieved = check_goal(b, goal) ? 1 : 0;
+        rec.bg_spent = initial_bg - bg;
+        rec.bl_spent = initial_bl - bl;
+        rec.decision_step = depth;
+        rec.terminal_reason = terminal_reason;
+        for (const auto& slot : b) {
+            const int tier = get_tier(slot.opt_idx, slot.val);
+            if (tier >= 1 && tier <= 5)
+                rec.tier_counts[static_cast<size_t>(tier - 1)]++;
+            int& mx = rec.opt_max_tier[static_cast<size_t>(slot.opt_idx)];
+            if (tier > mx) mx = tier;
         }
     }
 
     std::vector<Record> extract_records(int max_depth = 200) {
         std::vector<Record> recs;
-        int switch_matched = -1;
-        int switch_bl_remaining = -1;
+        Biscuit b = initial_biscuit;
+        int bg = initial_bg, bl = initial_bl;
         int idx = 0;
+        int switch_matched = -1, switch_bl_remaining = -1;
+
         for (int depth = 0; depth < max_depth; ++depth) {
+            Record rec;
+            fill_state_record(rec, b, bg, bl, depth, 0);
+
             const Node& node = nodes[idx];
-            if (node.is_terminal(goal)) {
-                Record terminal;
-                terminal.progress = goal_progress(node.biscuit, goal);
-                terminal.bg = node.bg;
-                terminal.bl = node.bl;
-                terminal.score = biscuit_score(node.biscuit);
-                terminal.matched_count = count_matched_slots(get_matched_slots(node.biscuit, goal));
-                terminal.goal_achieved = check_goal(node.biscuit, goal) ? 1 : 0;
-                terminal.bg_spent = initial_bg - node.bg;
-                terminal.bl_spent = initial_bl - node.bl;
-                terminal.decision_step = depth;
-                // 1=명시적 자발 STOP, 2=합법적인 리롤 행동이 더 이상 없음.
-                terminal.terminal_reason = node.stopped ? 1 : 2;
-                for (const auto& slot : node.biscuit) {
-                    const int tier = get_tier(slot.opt_idx, slot.val);
-                    if (tier >= 1 && tier <= 5)
-                        terminal.tier_counts[static_cast<size_t>(tier - 1)]++;
-                    int& mx = terminal.opt_max_tier[static_cast<size_t>(slot.opt_idx)];
-                    if (tier > mx) mx = tier;
+            int best_action = -1;
+            float best_q = -std::numeric_limits<float>::infinity();
+            float q_light_sum = 0.0f;
+            int q_light_count = 0;
+
+            for (int a = 0; a < N_ACTIONS; ++a) {
+                const int ci = node.children[a];
+                if (ci < 0 || nodes[ci].visits == 0) continue;
+                const float q = nodes[ci].value / static_cast<float>(nodes[ci].visits);
+                if (q > best_q) { best_q = q; best_action = a; }
+                if (a == ACTION_STOP) rec.q_stop = q;
+                else {
+                    if (q > rec.q_continue) rec.q_continue = q;
+                    if (a == ACTION_GENERAL) rec.q_general = q;
+                    else { q_light_sum += q; ++q_light_count; }
                 }
+            }
+            if (q_light_count > 0)
+                rec.q_light_avg = q_light_sum / static_cast<float>(q_light_count);
+
+            if (best_action < 0) break;
+            rec.best_action = best_action;
+            rec.best_q = best_q;
+            recs.push_back(rec);
+
+            if (best_action == ACTION_STOP) {
+                Record terminal;
+                fill_state_record(terminal, b, bg, bl, depth + 1, 1);
                 recs.push_back(terminal);
                 break;
             }
-            int best_a = -1; float best_q = -1e9f;
-            float q_gen = 0.0f, q_light_sum = 0.0f; int q_light_cnt = 0;
-            float q_stop = -1.0f, q_continue = -1e9f;
-            for (int a = 0; a < N_ACTIONS; ++a) {
-                int ci = node.children[a];
-                if (ci < 0) continue;
-                const Node& child = nodes[ci];
-                if (child.visits == 0) continue;
-                float q = child.value / static_cast<float>(child.visits);
-                if (q > best_q) { best_q = q; best_a = a; }
-                if (a == ACTION_STOP) q_stop = q;
-                else {
-                    if (q > q_continue) q_continue = q;
-                    if (a == ACTION_GENERAL) q_gen = q;
-                    else { q_light_sum += q; ++q_light_cnt; }
-                }
+
+            if (best_action >= ACTION_LIGHT_FIRST &&
+                best_action <= ACTION_LIGHT_LAST && switch_matched < 0) {
+                switch_matched = rec.matched_count;
+                switch_bl_remaining = bl;
             }
-            if (best_a < 0) break;
-            Record rec;
-            rec.progress = goal_progress(node.biscuit, goal);
-            rec.bg = node.bg;
-            rec.bl = node.bl;
-            rec.best_action = best_a;
-            rec.best_q = best_q;
-            rec.q_general = q_gen;
-            rec.q_light_avg = q_light_cnt > 0 ?
-                q_light_sum / static_cast<float>(q_light_cnt) : 0.0f;
-            rec.q_stop = q_stop;
-            rec.q_continue = q_continue > -1e8f ? q_continue : -1.0f;
-            rec.score = biscuit_score(node.biscuit);
-            rec.matched_count = count_matched_slots(get_matched_slots(node.biscuit, goal));
-            rec.goal_achieved = check_goal(node.biscuit, goal) ? 1 : 0;
-            rec.bg_spent = initial_bg - node.bg;
-            rec.bl_spent = initial_bl - node.bl;
-            rec.decision_step = depth;
-            rec.tier_counts.fill(0);
-            rec.opt_max_tier.fill(0);
-            for (const auto& s : node.biscuit) {
-                int t = get_tier(s.opt_idx, s.val);
-                // get_tier() returns tiers 1..5; CSV columns tier_0..tier_4 are zero-based.
-                if (t >= 1 && t <= static_cast<int>(rec.tier_counts.size()))
-                    rec.tier_counts[static_cast<size_t>(t - 1)]++;
-                int& mx = rec.opt_max_tier[s.opt_idx];
-                if (t > mx) mx = t;
+
+            apply_action(b, bg, bl, best_action);
+            idx = node.children[best_action];
+            if (idx < 0) break;
+
+            const auto matched = get_matched_slots(b, goal);
+            bool has_legal_continue =
+                is_action_legal(b, bg, bl, goal, ACTION_GENERAL);
+            for (int a = ACTION_LIGHT_FIRST; a <= ACTION_LIGHT_LAST; ++a)
+                has_legal_continue = has_legal_continue ||
+                    is_action_legal(b, bg, bl, goal, a);
+            if (!has_legal_continue) {
+                Record terminal;
+                fill_state_record(terminal, b, bg, bl, depth + 1, 2);
+                recs.push_back(terminal);
+                break;
             }
-            if (best_a >= ACTION_LIGHT_FIRST && best_a <= ACTION_LIGHT_LAST &&
-                switch_matched < 0) {
-                const auto matched = get_matched_slots(node.biscuit, goal);
-                switch_matched = count_matched_slots(matched);
-                switch_bl_remaining = node.bl;
-            }
-            recs.push_back(rec);
-            int ci = node.children[best_a];
-            if (ci < 0) break;
-            idx = ci;
         }
-        // 첫 빛도우 행동이 있는 경우, 해당 전환 시점 정보를 경로 전체에 기록한다.
-        // 전환이 없으면 -1을 유지해 실제 0개와 구분한다.
+
         if (switch_matched >= 0) {
             for (auto& rec : recs) {
                 rec.matched_at_switch = switch_matched;
