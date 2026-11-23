@@ -804,7 +804,7 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
-    std::cout << "[Info] threads=    std::cout << "[Info] threads=" << std::max(1u, std::thread::hardware_concurrency())
+    std::cout << "[Info] threads=" << std::max(1u, std::thread::hardware_concurrency())
               << " id_range=[" << id_start << "," << id_end << ")"
               << " n_sim=" << n_sim << std::endl;
 
