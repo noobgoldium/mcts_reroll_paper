@@ -85,7 +85,7 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     # 동일한 tier/goal/chunk 중복 실행만 방지한다.
     concurrency:
-      group: mcts-matrix-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
+      group: mcts-matrix-${{ inputs.experiment }}-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
       cancel-in-progress: false
     env:
       TIER: ${{ inputs.tier }}
