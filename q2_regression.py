@@ -1,240 +1,160 @@
 """
-Q2: 빛도우 세션에서 잔여 자원량에 따른 만족 기준치가 파인만 공식과 수렴하는가?
-- 파인만 맛집 공식: threshold ∝ √n / √(n+1)  (PNAS 2026)
-- 입력: resource_tier, goal_id, bl_remaining_at_switch, matched_at_switch, progress
-- 출력: q_light_avg (빛도우 세션 평균 Q값, 연속값) → 회귀
-- 추가: 예측값을 파인만 공식과 비교해 수렴 여부 검증
+Q2: 잔여 빛도우 수에 따른 MCTS의 경험적 중단 품질 임계값을 추정한다.
+
+주의:
+- q_light_avg는 세션 평균이 아니라, 한 open-loop 노드에서 합법적인 빛도우 행동 Q의 평균이다.
+- 이 분석은 q_stop - q_continue의 부호가 바뀌는 biscuit_score를 중단 임계값의
+  경험적 대리변수로 사용한다.
+- 일반도우가 합법적인 상태가 섞이지 않도록 해당 노드의 state_matched_min >= 2를 요구한다.
+- Feynman 임계값과의 비교는 구조적 유사성 검토이지, 두 문제의 수학적 동등성 증명이 아니다.
 """
 
-import pandas as pd
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 import glob
 import os
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-# ── 설정 ─────────────────────────────────────────────────────────────────────
-CSV_DIR  = "."
-BATCH    = 512
-EPOCHS   = 60
-LR       = 1e-3
-HIDDEN   = [256, 128, 64]
-SEED     = 42
-DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
+CSV_DIR = "."
+SEED = 42
 
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-
-# ── 파인만 공식 ───────────────────────────────────────────────────────────────
-def feynman_threshold(n: np.ndarray) -> np.ndarray:
-    """√n / √(n+1) — 잔여 자원 n에 대한 만족 기준치"""
-    n = np.asarray(n, dtype=np.float64)
-    return np.sqrt(n) / np.sqrt(n + 1)
-
-# ── CSV 로드 ──────────────────────────────────────────────────────────────────
-def load_csvs(csv_dir: str) -> pd.DataFrame:
-    files = glob.glob(os.path.join(csv_dir, "biscuit_tier_*.csv"))
-    if not files:
-        raise FileNotFoundError(f"CSV 없음: {csv_dir}/biscuit_tier_*.csv")
-    dfs = []
-    for f in files:
-        try:
-            dfs.append(pd.read_csv(f))
-        except Exception as e:
-            print(f"  skip {f}: {e}")
-    df = pd.concat(dfs, ignore_index=True)
-    print(f"총 {len(df):,}행 로드 ({len(files)}개 파일)")
-    return df
-
-# ── 전처리 ────────────────────────────────────────────────────────────────────
-FEATURE_COLS = [
+FEATURES = [
     "resource_tier",
     "goal_id",
-    "bl_remaining_at_switch",  # 빛도우 전환 시 잔여량 — 핵심 변수
-    "matched_at_switch",       # 전환 시점에 이미 매칭된 수
-    "progress",
-    "budget_g",
-    "budget_l",
+    "state_bl_mean",
+    "state_progress_mean",
+    "state_matched_mean",
+    "state_score_mean",
 ]
-TARGET_COL = "q_light_avg"   # 빛도우 세션 평균 Q값
+TARGET = "stop_advantage"
 
-def preprocess(df: pd.DataFrame):
-    missing = [c for c in FEATURE_COLS + [TARGET_COL] if c not in df.columns]
+
+def feynman_threshold(n):
+    """PNAS 논문의 균등분포 임계값: sqrt(n) / (sqrt(n) + 1)."""
+    n = np.asarray(n, dtype=np.float64)
+    return np.sqrt(n) / (np.sqrt(n) + 1.0)
+
+
+def load_data():
+    files = glob.glob(os.path.join(CSV_DIR, "biscuit_tier_*.csv"))
+    if not files:
+        raise FileNotFoundError(f"CSV 없음: {CSV_DIR}/biscuit_tier_*.csv")
+    frames = [pd.read_csv(path) for path in files]
+    df = pd.concat(frames, ignore_index=True)
+
+    required = FEATURES + [
+        "q_stop", "q_continue", "terminal_reason", "state_samples",
+        "state_matched_min", "resource_tier", "goal_id", "biscuit_id",
+    ]
+    missing = sorted(set(required) - set(df.columns))
     if missing:
-        raise ValueError(f"컬럼 없음: {missing}")
+        raise ValueError(
+            f"현재 CSV 스키마에는 Q2에 필요한 필드가 없습니다: {missing}. "
+            "새 MCTS 엔진으로 데이터를 다시 생성해야 합니다."
+        )
 
-    df = df.dropna(subset=FEATURE_COLS + [TARGET_COL])
+    df = df.dropna(subset=required).copy()
+    df = df[
+        (df["terminal_reason"] == 0)
+        & (df["state_samples"] > 0)
+        & (df["state_matched_min"] >= 2)
+        & (df["state_bl_mean"] > 0)
+        & (df["q_stop"] >= 0)
+        & (df["q_continue"] >= 0)
+    ].copy()
 
-    # bl_remaining이 0인 행 제외 (전환 안 한 케이스)
-    df = df[df["bl_remaining_at_switch"] > 0].copy()
-
-    X = df[FEATURE_COLS].astype(np.float32).values
-    y = df[TARGET_COL].astype(np.float32).values
-
-    # 파인만 기준치 계산 (비교용)
-    n_remaining = df["bl_remaining_at_switch"].values
-    df["feynman_ref"] = feynman_threshold(n_remaining)
-
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X).astype(np.float32)
-
-    print(f"샘플 수: {len(X):,}  |  y 범위: [{y.min():.4f}, {y.max():.4f}]")
-    return X, y, scaler, df
-
-# ── Dataset ───────────────────────────────────────────────────────────────────
-class BiscuitDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
-
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, i):
-        return self.X[i], self.y[i]
-
-# ── 모델 ──────────────────────────────────────────────────────────────────────
-class MLPRegressor(nn.Module):
-    def __init__(self, in_dim: int, hidden: list, dropout=0.2):
-        super().__init__()
-        layers = []
-        prev = in_dim
-        for h in hidden:
-            layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(dropout)]
-            prev = h
-        layers.append(nn.Linear(prev, 1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x)
-
-# ── 학습 루프 ─────────────────────────────────────────────────────────────────
-def train(model, loader, opt, criterion):
-    model.train()
-    total_loss, n = 0.0, 0
-    for xb, yb in loader:
-        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-        pred = model(xb)
-        loss = criterion(pred, yb)
-        opt.zero_grad(); loss.backward(); opt.step()
-        total_loss += loss.item() * len(yb)
-        n += len(yb)
-    return total_loss / n
-
-@torch.no_grad()
-def evaluate(model, loader, criterion):
-    model.eval()
-    total_loss, n = 0.0, 0
-    preds, targets = [], []
-    for xb, yb in loader:
-        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-        pred = model(xb)
-        total_loss += criterion(pred, yb).item() * len(yb)
-        preds.append(pred.cpu()); targets.append(yb.cpu())
-        n += len(yb)
-    preds = torch.cat(preds).numpy().flatten()
-    targets = torch.cat(targets).numpy().flatten()
-    ss_res = ((targets - preds) ** 2).sum()
-    ss_tot = ((targets - targets.mean()) ** 2).sum()
-    r2 = 1 - ss_res / ss_tot
-    return total_loss / n, r2, preds, targets
-
-# ── 파인만 수렴 검증 ──────────────────────────────────────────────────────────
-def feynman_convergence_test(df_full: pd.DataFrame, preds: np.ndarray, te_idx: np.ndarray):
-    """
-    예측된 q_light_avg vs 파인만 기준치 상관관계 분석
-    수렴 기준: Pearson r > 0.7, p < 0.05
-    """
-    from scipy import stats
-
-    df_te = df_full.iloc[te_idx].copy()
-    df_te["pred_q"] = preds
-    df_te["feynman_ref"] = feynman_threshold(df_te["bl_remaining_at_switch"].values)
-
-    r, p = stats.pearsonr(df_te["pred_q"], df_te["feynman_ref"])
-    print(f"\n── 파인만 수렴 검증 ──")
-    print(f"  Pearson r  = {r:.4f}")
-    print(f"  p-value    = {p:.4e}")
-
-    if r > 0.7 and p < 0.05:
-        print("  ✅ 수렴: MLP 예측값이 파인만 공식과 유의하게 상관")
-    elif r > 0.4 and p < 0.05:
-        print("  ⚠️  부분 수렴: 약한 상관, 추가 분석 필요")
-    else:
-        print("  ❌ 비수렴: 파인만 공식과 상관 없음")
-
-    # 구간별 평균 비교
-    df_te["tier_bin"] = pd.cut(df_te["bl_remaining_at_switch"], bins=5)
-    summary = df_te.groupby("tier_bin", observed=True).agg(
-        pred_q_mean=("pred_q", "mean"),
-        feynman_mean=("feynman_ref", "mean"),
-        count=("pred_q", "count"),
+    df[TARGET] = df["q_stop"] - df["q_continue"]
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURES + [TARGET])
+    df["group_id"] = (
+        df["resource_tier"].astype(str) + ":"
+        + df["goal_id"].astype(str) + ":"
+        + df["biscuit_id"].astype(str)
     )
-    print("\n  잔여량 구간별 비교:")
+    return df
+
+
+def estimate_threshold(model, row, feature_columns, grid):
+    """q_stop - q_continue가 음수에서 0 이상으로 바뀌는 최초 score."""
+    candidates = pd.DataFrame(
+        [{**row, "state_score_mean": float(score)} for score in grid],
+        columns=feature_columns,
+    )
+    pred = model.predict(candidates)
+    crossing = np.flatnonzero(pred >= 0.0)
+    if len(crossing) == 0:
+        return np.nan
+    return float(grid[crossing[0]])
+
+
+def main():
+    df = load_data()
+    if len(df) < 100:
+        raise RuntimeError(
+            f"Q2 분석 표본이 부족합니다: {len(df)}행. "
+            "MCTS 탐색량 또는 biscuit 수를 늘려야 합니다."
+        )
+
+    X = df[FEATURES].astype(float).reset_index(drop=True)
+    y = df[TARGET].astype(float).reset_index(drop=True)
+    groups = df["group_id"].reset_index(drop=True)
+
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
+    train_idx, test_idx = next(splitter.split(X, y, groups))
+    model = ExtraTreesRegressor(
+        n_estimators=500,
+        min_samples_leaf=5,
+        max_features=1.0,
+        random_state=SEED,
+        n_jobs=-1,
+    )
+    model.fit(X.iloc[train_idx], y.iloc[train_idx])
+
+    pred = model.predict(X.iloc[test_idx])
+    y_test = y.iloc[test_idx].to_numpy()
+    print(f"표본 수: {len(df):,} | train: {len(train_idx):,} | test: {len(test_idx):,}")
+    print(f"Stop advantage R²: {r2_score(y_test, pred):.4f}")
+    print(f"MAE: {mean_absolute_error(y_test, pred):.5f}")
+    print(f"RMSE: {mean_squared_error(y_test, pred) ** 0.5:.5f}")
+
+    # 테스트 표본별로 다른 상태 변수는 고정하고 현재 비스킷 점수만 변화시킨다.
+    score_grid = np.linspace(0.0, 200.0, 401)
+    rows = []
+    for i in test_idx:
+        row = X.iloc[i].to_dict()
+        threshold = estimate_threshold(model, row, FEATURES, score_grid)
+        if np.isfinite(threshold):
+            n = float(row["state_bl_mean"])
+            rows.append({
+                "n_remaining": n,
+                "estimated_threshold": threshold / 200.0,
+                "feynman_threshold": float(feynman_threshold(n)),
+                "absolute_error": abs(
+                    threshold / 200.0 - float(feynman_threshold(n))
+                ),
+            })
+
+    if not rows:
+        print("중단 임계값의 부호 교차가 관측되지 않아 Feynman 비교를 수행할 수 없습니다.")
+        return
+
+    result = pd.DataFrame(rows)
+    print(f"임계값 추정 가능 표본: {len(result):,}")
+    print(
+        "Feynman 비교 | "
+        f"MAE={result['absolute_error'].mean():.5f} | "
+        f"RMSE={np.sqrt(np.mean((result['estimated_threshold'] - result['feynman_threshold']) ** 2)):.5f}"
+    )
+    result["remaining_bin"] = result["n_remaining"].round().astype(int)
+    summary = result.groupby("remaining_bin").agg(
+        estimated=("estimated_threshold", "mean"),
+        feynman=("feynman_threshold", "mean"),
+        samples=("estimated_threshold", "size"),
+    )
+    print("\n잔여 빛도우 수별 임계값:")
     print(summary.to_string())
 
-    return r, p
-
-# ── 메인 ──────────────────────────────────────────────────────────────────────
-def main():
-    print(f"Device: {DEVICE}")
-
-    # 1. 데이터
-    df = load_csvs(CSV_DIR)
-    X, y, scaler, df_processed = preprocess(df)
-
-    idx = np.arange(len(X))
-    tr_idx, te_idx = train_test_split(idx, test_size=0.2, random_state=SEED)
-
-    tr_loader = DataLoader(BiscuitDataset(X[tr_idx], y[tr_idx]), batch_size=BATCH, shuffle=True)
-    te_loader = DataLoader(BiscuitDataset(X[te_idx], y[te_idx]), batch_size=BATCH)
-
-    # 2. 모델
-    model = MLPRegressor(X.shape[1], HIDDEN).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
-    criterion = nn.MSELoss()
-
-    # 3. 학습
-    best_r2, best_state = -999, None
-    for epoch in range(1, EPOCHS + 1):
-        tr_loss = train(model, tr_loader, opt, criterion)
-        va_loss, va_r2, _, _ = evaluate(model, te_loader, criterion)
-        scheduler.step()
-
-        if va_r2 > best_r2:
-            best_r2 = va_r2
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d} | train MSE {tr_loss:.6f} | val MSE {va_loss:.6f} R² {va_r2:.4f}")
-
-    # 4. 최종 평가
-    model.load_state_dict(best_state)
-    _, test_r2, preds, targets = evaluate(model, te_loader, criterion)
-    rmse = np.sqrt(((targets - preds) ** 2).mean())
-    print(f"\n✅ Best val R²: {best_r2:.4f}  |  Test R²: {test_r2:.4f}  |  RMSE: {rmse:.6f}")
-
-    # 5. 파인만 수렴 검증
-    try:
-        feynman_convergence_test(df_processed, preds, te_idx)
-    except ImportError:
-        print("scipy 없음 — pip install scipy 후 재실행")
-
-    # 6. 저장
-    torch.save({
-        "model_state": best_state,
-        "scaler_mean": scaler.mean_,
-        "scaler_scale": scaler.scale_,
-        "feat_cols": FEATURE_COLS,
-        "hidden": HIDDEN,
-        "test_r2": test_r2,
-        "rmse": rmse,
-    }, "q2_regression.pt")
-    print("\n모델 저장: q2_regression.pt")
 
 if __name__ == "__main__":
     main()
