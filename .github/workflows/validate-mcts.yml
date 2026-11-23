@@ -73,7 +73,7 @@ jobs:
           fields = [
               "resource_tier","goal_id","state_bl_mean","state_progress_mean",
               "state_matched_mean","state_score_mean","q_stop","q_continue",
-              "terminal_reason","state_samples","state_matched_min","biscuit_id","decision_step"
+              "terminal_reason","state_samples","state_matched_min","biscuit_id","rng_seed","decision_step"
           ]
           with open("out/q2_synthetic/biscuit_tier_0_goal_0.csv","w",newline="") as f:
               w = csv.DictWriter(f,fieldnames=fields); w.writeheader()
@@ -87,7 +87,7 @@ jobs:
                           "state_progress_mean":0.5,"state_matched_mean":2.5,
                           "state_score_mean":score,"q_stop":stop,"q_continue":cont,
                           "terminal_reason":0,"state_samples":100,
-                          "state_matched_min":2,"biscuit_id":biscuit,
+                          "state_matched_min":2,"biscuit_id":biscuit,"rng_seed":123456 + biscuit,
                           "decision_step":step
                       })
           PY
