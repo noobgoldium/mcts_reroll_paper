@@ -49,7 +49,7 @@ def load_data(csv_dir):
 
     required = FEATURES + [
         "q_stop", "q_continue", "terminal_reason", "state_samples",
-        "state_matched_min", "resource_tier", "goal_id", "biscuit_id",
+        "state_matched_min", "resource_tier", "goal_id", "biscuit_id", "rng_seed",
     ]
     missing = sorted(set(required) - set(df.columns))
     if missing:
@@ -73,11 +73,12 @@ def load_data(csv_dir):
     df["group_id"] = (
         df["resource_tier"].astype(str) + ":"
         + df["goal_id"].astype(str) + ":"
-        + df["biscuit_id"].astype(str)
+        + df["biscuit_id"].astype(str) + ":"
+        + df["rng_seed"].astype(str)
     )
     # 같은 biscuit episode의 동일 상태가 중복 CSV로 들어오지 않도록 한다.
     df = df.drop_duplicates(
-        subset=["resource_tier", "goal_id", "biscuit_id", "decision_step"],
+        subset=["resource_tier", "goal_id", "biscuit_id", "rng_seed", "decision_step"],
         keep="first",
     )
     return df
