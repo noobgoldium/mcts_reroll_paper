@@ -89,7 +89,8 @@ jobs:
                           "state_score_mean":score,"q_stop":stop,"q_continue":cont,
                           "terminal_reason":0,"state_samples":100,
                           "state_matched_min":2,"biscuit_id":biscuit,"rng_seed":123456 + biscuit,
-                          "q_stop_visits":100,"q_continue_visits":100,"q_continue_action":1,
+                          "q_stop_visits":(1 if biscuit == 0 and step == 0 else 100),
+                          "q_continue_visits":100,"q_continue_action":1,
                           "decision_step":step
                       })
           PY
@@ -98,7 +99,10 @@ jobs:
           .venv/bin/python - <<'PY'
           import numpy as np
           import pandas as pd
-          from q2_regression import estimate_threshold, FEATURES
+          from q2_regression import estimate_threshold, load_data, FEATURES
+
+          filtered = load_data("out/q2_synthetic", min_q_visits=20, min_state_samples=20)
+          assert len(filtered) == 319, f"low-visit row was not filtered: {len(filtered)} rows"
 
           class StepModel:
               def predict(self, frame):
@@ -133,7 +137,8 @@ jobs:
               "terminal_reason", "rng_seed", "state_samples",
               "state_progress_mean", "state_matched_mean", "state_bg_mean",
               "state_bl_mean", "state_score_mean", "state_matched_min",
-              "state_matched_max",
+              "state_matched_max", "q_stop_visits", "q_continue_visits",
+              "q_continue_action",
           }
           assert required.issubset(rows[0].keys()), "missing STOP-analysis columns"
           assert all(int(row["best_action"]) in {-1, 0, 1, 2, 3, 4, 5} for row in rows)
