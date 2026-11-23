@@ -335,13 +335,9 @@ struct MCTSTree {
                     legal[legal_count++] = a;
             if (legal_count == 0) break;
 
-            int a = ACTION_GENERAL;
-            if (matched_count > 0) {
-                if (matched_count >= 2 || bg < 1 || bl < 1)
-                    a = legal[tl_rng.next_int(legal_count)];
-                else if (tl_rng.next_int(10) >= 8)
-                    a = legal[tl_rng.next_int(legal_count)];
-            }
+            // 일반도우는 매칭 슬롯이 0개일 때만 legal 목록에 들어간다.
+            // 따라서 매칭 이후에는 반드시 미매칭 슬롯의 빛도우 중에서 고른다.
+            const int a = legal[tl_rng.next_int(legal_count)];
             if (a == ACTION_GENERAL) {
                 b = reroll_general(b);
                 --bg;
@@ -445,7 +441,8 @@ struct MCTSTree {
                 int& mx = rec.opt_max_tier[s.opt_idx];
                 if (t > mx) mx = t;
             }
-            if (best_a >= 1 && switch_matched < 0) {
+            if (best_a >= ACTION_LIGHT_FIRST && best_a <= ACTION_LIGHT_LAST &&
+                switch_matched < 0) {
                 const auto matched = get_matched_slots(node.biscuit, goal);
                 switch_matched = count_matched_slots(matched);
                 switch_bl_remaining = node.bl;
