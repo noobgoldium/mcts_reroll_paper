@@ -370,7 +370,7 @@ struct MCTSTree {
     void run(int n_sim) {
         for (int i = 0; i < n_sim; ++i) {
             int leaf = select();
-            if (!nodes[leaf].is_terminal())
+            if (!nodes[leaf].is_terminal(goal))
                 leaf = expand(leaf);
             backprop(leaf, rollout(leaf));
         }
@@ -569,7 +569,7 @@ std::vector<Biscuit> generate_inits(const Biscuit& base, int n, bool has_attribu
             int nr = tl_rng.next_int(3);
             for (int j = 0; j < nr; ++j) {
                 int pos = tl_rng.next_int(4);
-                int opt = tl_rng.next_int(N_OPTS);
+                int opt = tl_rng.next_int(has_attribute_damage ? N_OPTS : N_OPTS - 1);
                 int vidx = tl_rng.next_int(OPT_SIZES[opt]);
                 inits[i][pos] = { opt, OPT_VALS[opt][vidx] };
             }
