@@ -24,7 +24,7 @@ jobs:
         run: |
           python3 -m venv .venv
           .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install numpy pandas scikit-learn
+          .venv/bin/pip install numpy pandas scikit-learn pyyaml
 
       - name: Compile C++26 engine
         run: |
@@ -37,6 +37,13 @@ jobs:
           ./mcts_engine --tier 0 --goal 0 --n_starts 2 --n_sim 100 --id_start 0 --id_end 1 --seed 123456 --out out/smoke_repeat.csv
           cmp out/smoke.csv out/smoke_repeat.csv
           .venv/bin/python -m py_compile q1_classifier.py q1_policy_analysis.py q2_regression.py
+          .venv/bin/python - <<'PY'
+          import yaml
+          for path in (".github/workflows/run_mcts.yml", ".github/workflows/validate-mcts.yml"):
+              with open(path, encoding="utf-8") as f:
+                  yaml.safe_load(f)
+              print("valid YAML:", path)
+          PY
           ./mcts_engine --tier 0 --goal 0 --n_starts 30 --id_start 0 --id_end 30 --seed 123456 --q1_compare --q1_out out/q1_smoke.csv
           ./mcts_engine --tier 0 --goal 0 --n_starts 30 --id_start 0 --id_end 30 --seed 123456 --q1_compare --q1_out out/q1_smoke_repeat.csv
           cmp out/q1_smoke.csv out/q1_smoke_repeat.csv
