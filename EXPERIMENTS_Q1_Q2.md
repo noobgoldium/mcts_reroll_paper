@@ -37,15 +37,19 @@ python q1_policy_analysis.py out/q1_policy_tier_0_goal_0.csv \
 
 ## Q2: 경험적 중단 임계값과 Feynman 기준 비교
 
-Q2는 각 Open-loop 행동 이력 노드에서 다음 값을 사용한다.
+Q2는 각 Open-loop 행동 이력 노드에서 다음 edge-value gap을 분석한다.
 
 ```
-stop_advantage = q_stop - q_continue
+edge_value_gap = q_stop - q_continue
 ```
 
-여기서 `q_continue`는 합법적인 계속 행동 중 가장 높은 Q값이다. 예측된 `stop_advantage`가 음수에서 양수로 바뀌는 지점의 `biscuit_score / 200`을 경험적 중단 품질 임계값으로 정의한다. 점수의 이론적 상한은 슬롯별 최대 기여도 50점 × 4슬롯 = 200점이다.
+`q_continue`는 해당 decision row의 대표 상태에서 합법적인 계속 행동 중 가장 높은 Q값이다. CSV에는 이 값에 해당하는 `q_continue_action`과 그 자식 edge의 방문 수 `q_continue_visits`, STOP edge의 방문 수 `q_stop_visits`도 기록한다. 분석 기본값은 두 edge 모두 최소 20회 방문, 부모 노드 상태 표본 최소 20회다. 필요하면 `--min-q-visits`, `--min-state-samples`로 조정할 수 있다.
 
-일반도우가 합법적인 상태가 섞이지 않도록 `state_matched_min >= 2`인 노드만 사용한다. 학습/테스트 분리는 biscuit episode 단위 GroupShuffleSplit으로 수행한다. 여러 decision row가 한 비스킷에서 나오는 점을 고려해 최종 CI는 episode 단위 cluster bootstrap으로 계산한다.
+**중요한 해석 제한:** Open-loop 노드에서 STOP edge는 노드의 상태 표본 전체에서 평가되지만, 특정 continue edge는 그 행동이 합법적인 상태에서만 선택·방문된다. 따라서 두 Q값은 동일 상태에 대한 paired counterfactual이 아니며, 그 차이를 인과적인 STOP 최적 경계나 이론적 최적 중단점으로 해석할 수 없다. 이 분석의 임계점은 상태분포가 섞인 open-loop edge-value gap의 기술적 부호 전환점이다. `state_score_mean`을 변화시키는 회귀 곡선도 인과효과가 아니라 관측된 상태 특성에 대한 조건부 예측이다.
+
+ExtraTrees 예측은 계단형이므로 임계값에 선형 보간을 적용하지 않는다. 0~200 점수 범위의 0.5점 grid에서 처음 음수→0 이상으로 바뀌는 구간의 상단 grid 점을 추정값으로 기록하고, 구간 하한/상한도 함께 저장한다. 점수의 이론적 상한은 슬롯별 최대 기여도 50점 × 4슬롯 = 200점이다.
+
+일반도우가 합법적인 상태가 섞이지 않도록 `state_matched_min >= 2`인 노드만 사용한다. 학습/테스트 분리는 biscuit episode 단위 GroupShuffleSplit으로 수행한다. 여러 decision row가 한 비스킷에서 나오는 점을 고려해 최종 CI는 episode 단위 cluster bootstrap으로 계산한다. 이 CI는 고정된 학습 모델을 조건으로 한 표본 불확실성이며 모델 재학습 불확실성은 포함하지 않는다.
 
 Feynman 비교식은 다음과 같다.
 
