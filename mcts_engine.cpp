@@ -225,6 +225,7 @@ struct Node {
 
     // State distribution observed at this open-loop action-history node.
     uint64_t state_samples = 0;
+    int state_matched_min = 5, state_matched_max = 0;
     double progress_sum = 0.0, matched_sum = 0.0;
     double bg_sum = 0.0, bl_sum = 0.0, score_sum = 0.0;
 };
@@ -245,6 +246,7 @@ struct Record {
     int terminal_reason = 0; // 0=decision, 1=voluntary stop, 2=no legal continuation
     uint64_t rng_seed = 0;
     uint64_t state_samples = 0;
+    int state_matched_min = -1, state_matched_max = -1;
     double state_progress_mean = 0.0, state_matched_mean = 0.0;
     double state_bg_mean = 0.0, state_bl_mean = 0.0, state_score_mean = 0.0;
 };
@@ -289,8 +291,11 @@ struct MCTSTree {
     void observe_state(int idx, const Biscuit& b, int bg, int bl) {
         Node& n = nodes[idx];
         ++n.state_samples;
+        const int matched = count_matched_slots(get_matched_slots(b, goal));
+        n.state_matched_min = std::min(n.state_matched_min, matched);
+        n.state_matched_max = std::max(n.state_matched_max, matched);
         n.progress_sum += goal_progress(b, goal);
-        n.matched_sum += count_matched_slots(get_matched_slots(b, goal));
+        n.matched_sum += matched;
         n.bg_sum += bg;
         n.bl_sum += bl;
         n.score_sum += biscuit_score(b);
@@ -298,6 +303,8 @@ struct MCTSTree {
 
     void fill_state_stats(Record& rec, const Node& n) const {
         rec.state_samples = n.state_samples;
+        rec.state_matched_min = n.state_matched_min;
+        rec.state_matched_max = n.state_matched_max;
         if (n.state_samples == 0) return;
         const double inv = 1.0 / static_cast<double>(n.state_samples);
         rec.state_progress_mean = n.progress_sum * inv;
@@ -595,7 +602,8 @@ static const std::string CSV_HEADER =
 "goal_id,resource_tier,biscuit_id,matched_at_switch,bl_remaining_at_switch,"
 "q_stop,q_continue,biscuit_score,matched_count,goal_achieved,"
 "bg_spent,bl_spent,decision_step,terminal_reason,rng_seed,"
-"state_samples,state_progress_mean,state_matched_mean,state_bg_mean,state_bl_mean,state_score_mean\n";
+"state_samples,state_progress_mean,state_matched_mean,state_bg_mean,state_bl_mean,state_score_mean,"
+"state_matched_min,state_matched_max\n";
 
 static constexpr int EXIT_INTERRUPTED = 75;       // SIGINT/SIGTERM 안전 종료
 
@@ -694,7 +702,8 @@ int run_mcts_pipeline(const MCTSConfig& cfg)
                   << "," << r.rng_seed << "," << r.state_samples
                   << "," << r.state_progress_mean << "," << r.state_matched_mean
                   << "," << r.state_bg_mean << "," << r.state_bl_mean
-                  << "," << r.state_score_mean << "\n";
+                  << "," << r.state_score_mean << "," << r.state_matched_min
+                  << "," << r.state_matched_max << "\n";
             }
             f.flush();
         };
