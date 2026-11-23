@@ -20,6 +20,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++-14
 
+      - name: Set up Python analysis dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install numpy pandas scikit-learn
+
       - name: Compile C++26 engine
         run: |
           g++-14 -O2 -std=c++26 -pthread -Wall -Wextra -Wpedantic mcts_engine.cpp -o mcts_engine
@@ -30,7 +36,7 @@ jobs:
           ./mcts_engine --tier 0 --goal 0 --n_starts 2 --n_sim 100 --id_start 0 --id_end 1 --seed 123456 --out out/smoke.csv
           ./mcts_engine --tier 0 --goal 0 --n_starts 2 --n_sim 100 --id_start 0 --id_end 1 --seed 123456 --out out/smoke_repeat.csv
           cmp out/smoke.csv out/smoke_repeat.csv
-          python3 -m py_compile q1_classifier.py q2_regression.py
+          .venv/bin/python -m py_compile q1_classifier.py q1_policy_analysis.py q2_regression.py
           ./mcts_engine --tier 0 --goal 0 --n_starts 30 --id_start 0 --id_end 30 --seed 123456 --q1_compare --q1_out out/q1_smoke.csv
           python3 - <<'PY'
           import csv
@@ -49,6 +55,8 @@ jobs:
               assert all(a[c] == b[c] for c in initial_cols), f"unpaired initial biscuit {biscuit_id}"
           print(f"validated {len(rows)} Q1 rows across {len(paired)} paired biscuits")
           PY
+          .venv/bin/python q1_policy_analysis.py out/q1_smoke.csv --bootstrap 200 --output out/q1_analysis.csv
+          test -s out/q1_analysis.csv
           mkdir -p out/q2_synthetic
           python3 - <<'PY'
           import csv, math, random
@@ -74,7 +82,7 @@ jobs:
                           "decision_step":step
                       })
           PY
-          python3 q2_regression.py --csv-dir out/q2_synthetic --bootstrap 100 --min-groups-per-bin 2 --output-prefix out/q2_smoke
+          .venv/bin/python q2_regression.py --csv-dir out/q2_synthetic --bootstrap 100 --min-groups-per-bin 2 --output-prefix out/q2_smoke
           test -s out/q2_smoke_threshold_summary.csv
 
       - name: Validate new CSV schema and terminal records
