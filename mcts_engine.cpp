@@ -171,19 +171,22 @@ inline Biscuit reroll_light(const Biscuit& b, int pos) {
     return nb;
 }
 
-inline float compute_reward(const Biscuit& b, const Goal& goal, bool success) {
-    if (success) return 10.0f;
-    float prog = goal_progress(b, goal);
-    float score_norm = biscuit_score(b) / 200.0f;
-    float prog_weight = std::pow(prog * 2.0f, 3.0f);
+inline float compute_reward(const Biscuit& b, const Goal& goal) {
+    const float prog = goal_progress(b, goal);
+    const float score_norm = biscuit_score(b) / 200.0f;
+    const float prog_weight = std::pow(prog * 2.0f, 3.0f);
     return prog_weight + score_norm * 0.1f;
 }
 
 // ── MCTS ──────────────────────────────────────────────────
-static const int N_ACTIONS = 5;
+static constexpr int ACTION_GENERAL = 0;
+static constexpr int ACTION_LIGHT_FIRST = 1;
+static constexpr int ACTION_LIGHT_LAST = 4;
+static constexpr int ACTION_STOP = 5;
+static constexpr int N_ACTIONS = 6;
 
-// 세 행동 제약을 트리 탐색과 롤아웃에서 공유한다.
-// action 0: 일반도우, action 1..4: 각 슬롯의 빛도우.
+// 행동 제약은 트리 탐색과 롤아웃에서 공유한다.
+// 매칭 슬롯이 생기면 일반도우를 금지하고, 빛도우는 미매칭 슬롯에만 사용한다.
 inline int count_matched_slots(const std::array<bool, 4>& matched) {
     int count = 0;
     for (bool m : matched) if (m) ++count;
@@ -198,22 +201,23 @@ inline bool is_action_legal(
     const auto matched = get_matched_slots(biscuit, goal);
     const int matched_count = count_matched_slots(matched);
 
-    if (action == 0)
-        return bg >= 1 && matched_count < 2;
-
-    const int pos = action - 1;
-    return bl >= 1 && matched_count > 0 && !matched[static_cast<size_t>(pos)];
+    if (action == ACTION_STOP) return true;
+    if (action == ACTION_GENERAL)
+        return bg >= 1 && matched_count == 0;
+    const int pos = action - ACTION_LIGHT_FIRST;
+    return bl >= 1 && pos >= 0 && pos < 4 &&
+        matched_count > 0 && !matched[static_cast<size_t>(pos)];
 }
 
 struct Node {
     Biscuit biscuit{};
     int bg = 0, bl = 0, parent = -1, action = -1;
-    std::array<int, N_ACTIONS> children{ -1,-1,-1,-1,-1 };
-    std::array<bool, N_ACTIONS> untried{ true,true,true,true,true };
+    std::array<int, N_ACTIONS> children{ -1,-1,-1,-1,-1,-1 };
+    std::array<bool, N_ACTIONS> untried{ true,true,true,true,true,true };
     float value = 0.0f;
     int visits = 0;
-    bool is_terminal() const { return bg < 1 && bl < 1; }
-    bool can_act(int a) const { return a == 0 ? bg >= 1 : bl >= 1; }
+    bool stopped = false;
+    bool is_terminal() const { return stopped || (bg < 1 && bl < 1); }
 };
 
 struct Record {
@@ -224,18 +228,23 @@ struct Record {
     int goal_id = -1;
     int resource_tier = -1;
     int biscuit_id = -1;
-    int matched_at_switch = -1; // 최적 경로의 첫 빛도우 행동 직전 매칭 슬롯 수
-    int bl_remaining_at_switch = -1; // 해당 행동 직전 남은 빛도우 수
+    int matched_at_switch = -1;
+    int bl_remaining_at_switch = -1;
+    float q_stop = 0.0f, q_continue = 0.0f, score = 0.0f;
+    int matched_count = 0, goal_achieved = 0;
+    int bg_spent = 0, bl_spent = 0, decision_step = 0;
+    int terminal_reason = 0; // 0=decision, 1=voluntary stop, 2=resource exhausted
 };
 
 struct MCTSTree {
     std::vector<Node>& nodes;
     const Goal& goal;
     int max_rollout;
+    int initial_bg, initial_bl;
 
     MCTSTree(std::vector<Node>& pool, const Biscuit& init,
         int bg, int bl, const Goal& g, int mr)
-        : nodes(pool), goal(g), max_rollout(mr)
+        : nodes(pool), goal(g), max_rollout(mr), initial_bg(bg), initial_bl(bl)
     {
         Node root;
         root.biscuit = init; root.bg = bg; root.bl = bl;
@@ -295,64 +304,54 @@ struct MCTSTree {
         if (n_acts == 0) return idx;
         int a = acts[tl_rng.next_int(n_acts)];
         node.untried[a] = false;
-        Biscuit nb; int new_bg = node.bg, new_bl = node.bl;
-        if (a == 0) { nb = reroll_general(node.biscuit); --new_bg; }
-        else { nb = reroll_light(node.biscuit, a - 1); --new_bl; }
+        Biscuit nb = node.biscuit;
+        int new_bg = node.bg, new_bl = node.bl;
+        if (a == ACTION_GENERAL) {
+            nb = reroll_general(node.biscuit);
+            --new_bg;
+        }
+        else if (a >= ACTION_LIGHT_FIRST && a <= ACTION_LIGHT_LAST) {
+            nb = reroll_light(node.biscuit, a - ACTION_LIGHT_FIRST);
+            --new_bl;
+        }
         int ci = new_node(nb, new_bg, new_bl, idx, a);
+        if (a == ACTION_STOP) nodes[ci].stopped = true;
         nodes[idx].children[a] = ci;
         return ci;
     }
 
-    // 롤아웃 루프 최적화 (데이터 품질 100% 보존)
     float rollout(int idx) {
         Biscuit b = nodes[idx].biscuit;
         int bg = nodes[idx].bg;
         int bl = nodes[idx].bl;
-        bool success = false;
-
-        // Goal의 요구 슬롯 수는 롤아웃 동안 변하지 않으므로 한 번만 계산한다.
-        int total_required = 0;
-        for (const auto& g : goal) total_required += g.required;
-
         for (int step = 0; step < max_rollout; ++step) {
-            // 기존 check_goal()과 동일한 매칭 결과를 재사용한다.
-            // 이전 구현은 같은 상태에서 get_matched_slots()를 연속 두 번 호출했다.
-            auto matched = get_matched_slots(b, goal);
-            int matched_count = 0;
-            for (bool m : matched) if (m) ++matched_count;
-            if (matched_count >= total_required) { success = true; break; }
+            const int matched_count = count_matched_slots(get_matched_slots(b, goal));
+            std::array<int, 4> legal{};
+            int legal_count = 0;
+            if (is_action_legal(b, bg, bl, goal, ACTION_GENERAL))
+                legal[legal_count++] = ACTION_GENERAL;
+            for (int a = ACTION_LIGHT_FIRST; a <= ACTION_LIGHT_LAST; ++a)
+                if (is_action_legal(b, bg, bl, goal, a))
+                    legal[legal_count++] = a;
+            if (legal_count == 0) break;
 
-            int a = -1;
-            std::array<int, 4> unmatched_actions{};
-            int unmatched_cnt = 0;
-            for (int i = 0; i < 4; ++i)
-                if (!matched[i]) unmatched_actions[unmatched_cnt++] = i + 1;
-
-            // 세 제약을 롤아웃에서도 강제한다.
-            // 0개 매칭: 빛도우 금지 → 일반도우만 가능.
-            // 2개 이상 매칭: 일반도우 금지 → 빛도우만 가능.
-            // 빛도우는 실제로 매칭 처리된 슬롯에는 사용할 수 없다.
-            if (matched_count == 0) {
-                if (bg >= 1) a = 0;
-                else break;
+            int a = ACTION_GENERAL;
+            if (matched_count > 0) {
+                if (matched_count >= 2 || bg < 1 || bl < 1)
+                    a = legal[tl_rng.next_int(legal_count)];
+                else if (tl_rng.next_int(10) >= 8)
+                    a = legal[tl_rng.next_int(legal_count)];
             }
-            else if (matched_count >= 2) {
-                if (bl >= 1 && unmatched_cnt > 0)
-                    a = unmatched_actions[tl_rng.next_int(unmatched_cnt)];
-                else break;
+            if (a == ACTION_GENERAL) {
+                b = reroll_general(b);
+                --bg;
             }
-            else if (bg >= 1 && bl >= 1) {
-                if (tl_rng.next_int(10) < 8) a = 0;
-                else a = unmatched_actions[tl_rng.next_int(unmatched_cnt)];
+            else {
+                b = reroll_light(b, a - ACTION_LIGHT_FIRST);
+                --bl;
             }
-            else if (bg >= 1) a = 0;
-            else if (bl >= 1 && unmatched_cnt > 0)
-                a = unmatched_actions[tl_rng.next_int(unmatched_cnt)];
-            else break;
-            if (a == 0) { b = reroll_general(b); --bg; }
-            else { b = reroll_light(b, a - 1); --bl; }
         }
-        return compute_reward(b, goal, success);
+        return compute_reward(b, goal);
     }
 
     void backprop(int idx, float r) {
@@ -379,9 +378,31 @@ struct MCTSTree {
         int idx = 0;
         for (int depth = 0; depth < max_depth; ++depth) {
             const Node& node = nodes[idx];
-            if (node.is_terminal()) break;
+            if (node.is_terminal()) {
+                Record terminal;
+                terminal.progress = goal_progress(node.biscuit, goal);
+                terminal.bg = node.bg;
+                terminal.bl = node.bl;
+                terminal.score = biscuit_score(node.biscuit);
+                terminal.matched_count = count_matched_slots(get_matched_slots(node.biscuit, goal));
+                terminal.goal_achieved = check_goal(node.biscuit, goal) ? 1 : 0;
+                terminal.bg_spent = initial_bg - node.bg;
+                terminal.bl_spent = initial_bl - node.bl;
+                terminal.decision_step = depth;
+                terminal.terminal_reason = node.stopped ? 1 : 2;
+                for (const auto& slot : node.biscuit) {
+                    const int tier = get_tier(slot.opt_idx, slot.val);
+                    if (tier >= 1 && tier <= 5)
+                        terminal.tier_counts[static_cast<size_t>(tier - 1)]++;
+                    int& mx = terminal.opt_max_tier[static_cast<size_t>(slot.opt_idx)];
+                    if (tier > mx) mx = tier;
+                }
+                recs.push_back(terminal);
+                break;
+            }
             int best_a = -1; float best_q = -1e9f;
             float q_gen = 0.0f, q_light_sum = 0.0f; int q_light_cnt = 0;
+            float q_stop = 0.0f, q_continue = -1e9f;
             for (int a = 0; a < N_ACTIONS; ++a) {
                 int ci = node.children[a];
                 if (ci < 0) continue;
@@ -389,8 +410,12 @@ struct MCTSTree {
                 if (child.visits == 0) continue;
                 float q = child.value / static_cast<float>(child.visits);
                 if (q > best_q) { best_q = q; best_a = a; }
-                if (a == 0) q_gen = q;
-                else { q_light_sum += q; ++q_light_cnt; }
+                if (a == ACTION_STOP) q_stop = q;
+                else {
+                    if (q > q_continue) q_continue = q;
+                    if (a == ACTION_GENERAL) q_gen = q;
+                    else { q_light_sum += q; ++q_light_cnt; }
+                }
             }
             if (best_a < 0) break;
             Record rec;
@@ -402,6 +427,14 @@ struct MCTSTree {
             rec.q_general = q_gen;
             rec.q_light_avg = q_light_cnt > 0 ?
                 q_light_sum / static_cast<float>(q_light_cnt) : 0.0f;
+            rec.q_stop = q_stop;
+            rec.q_continue = q_continue > -1e8f ? q_continue : 0.0f;
+            rec.score = biscuit_score(node.biscuit);
+            rec.matched_count = count_matched_slots(get_matched_slots(node.biscuit, goal));
+            rec.goal_achieved = check_goal(node.biscuit, goal) ? 1 : 0;
+            rec.bg_spent = initial_bg - node.bg;
+            rec.bl_spent = initial_bl - node.bl;
+            rec.decision_step = depth;
             rec.tier_counts.fill(0);
             rec.opt_max_tier.fill(0);
             for (const auto& s : node.biscuit) {
@@ -503,9 +536,12 @@ static const std::string CSV_HEADER =
 "opt0_tier,opt1_tier,opt2_tier,opt3_tier,opt4_tier,opt5_tier,"
 "opt6_tier,opt7_tier,opt8_tier,opt9_tier,opt10_tier,opt11_tier,"
 "best_action,best_q,q_general,q_light_avg,"
-"goal_id,resource_tier,biscuit_id,matched_at_switch,bl_remaining_at_switch\n";
+"goal_id,resource_tier,biscuit_id,matched_at_switch,bl_remaining_at_switch,"
+"q_stop,q_continue,biscuit_score,matched_count,goal_achieved,"
+"bg_spent,bl_spent,decision_step,terminal_reason\n";
 
-static constexpr size_t CSV_NCOLS = 29;          // 헤더 컬럼 수
+static constexpr size_t CSV_NCOLS = 38;
+static constexpr size_t CSV_BISCUIT_ID_COL = 26;
 static constexpr int EXIT_INCOMPLETE = 75;       // 시간제한/중단으로 미완료 → 재개 필요
 
 // 종료 요청 플래그 (SIGINT/SIGTERM 핸들러에서 설정)
@@ -553,7 +589,7 @@ std::unordered_set<int> get_completed_biscuit_ids(const std::string& path) {
         while (std::getline(ss, tok, ',')) cols.push_back(tok);
         if (cols.size() == CSV_NCOLS) {
             try {
-                completed.insert(std::stoi(cols[CSV_NCOLS - 3]));   // biscuit_id
+                completed.insert(std::stoi(cols[CSV_BISCUIT_ID_COL]));   // biscuit_id
             } catch (...) {}
         }
     }
@@ -642,7 +678,11 @@ int run_mcts_pipeline(const MCTSConfig& cfg,
                   << "," << r.q_general << "," << r.q_light_avg
                   << "," << r.goal_id << "," << r.resource_tier
                   << "," << r.biscuit_id << "," << r.matched_at_switch
-                  << "," << r.bl_remaining_at_switch << "\n";
+                  << "," << r.bl_remaining_at_switch
+                  << "," << r.q_stop << "," << r.q_continue << "," << r.score
+                  << "," << r.matched_count << "," << r.goal_achieved
+                  << "," << r.bg_spent << "," << r.bl_spent
+                  << "," << r.decision_step << "," << r.terminal_reason << "\n";
             }
             f.flush();
         };
