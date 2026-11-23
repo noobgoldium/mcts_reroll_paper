@@ -211,7 +211,13 @@ struct Node {
     float value = 0.0f;
     int visits = 0;
     bool stopped = false;
-    bool is_terminal() const { return stopped || (bg < 1 && bl < 1); }
+    bool is_terminal(const Goal& goal) const {
+        if (stopped) return true;
+        if (is_action_legal(biscuit, bg, bl, goal, ACTION_GENERAL)) return false;
+        for (int a = ACTION_LIGHT_FIRST; a <= ACTION_LIGHT_LAST; ++a)
+            if (is_action_legal(biscuit, bg, bl, goal, a)) return false;
+        return true;
+    }
 };
 
 struct Record {
@@ -264,7 +270,7 @@ struct MCTSTree {
 
     int select() {
         int idx = 0;
-        while (!nodes[idx].is_terminal()) {
+        while (!nodes[idx].is_terminal(goal)) {
             const Node& n = nodes[idx];
             bool has_untried = false;
             for (int a = 0; a < N_ACTIONS; ++a)
@@ -318,6 +324,11 @@ struct MCTSTree {
         Biscuit b = nodes[idx].biscuit;
         int bg = nodes[idx].bg;
         int bl = nodes[idx].bl;
+
+        // STOP은 terminal action이다. STOP 이후 rollout에서 상태를 변경하면 안 된다.
+        if (nodes[idx].stopped)
+            return compute_reward(b, goal);
+
         for (int step = 0; step < max_rollout; ++step) {
             std::array<int, 4> legal{};
             int legal_count = 0;
@@ -328,11 +339,10 @@ struct MCTSTree {
                     legal[legal_count++] = a;
             if (legal_count == 0) break;
 
-            // Rollout 정책은 합법 행동과 STOP을 균등 추출한다.
-            // STOP을 뽑으면 현재 상태를 terminal outcome으로 평가한다.
-            const int choice = tl_rng.next_int(legal_count + 1);
-            if (choice == legal_count) break;
-            const int a = legal[choice];
+            // Rollout 구간에서는 합법적인 계속 행동 중 하나를 표본화한다.
+            // 자발적 STOP의 확률을 임의로 부여하지 않으며, STOP 가치는
+            // 트리의 명시적 STOP action에서만 평가한다.
+            const int a = legal[tl_rng.next_int(legal_count)];
             if (a == ACTION_GENERAL) {
                 b = reroll_general(b);
                 --bg;
@@ -369,7 +379,7 @@ struct MCTSTree {
         int idx = 0;
         for (int depth = 0; depth < max_depth; ++depth) {
             const Node& node = nodes[idx];
-            if (node.is_terminal()) {
+            if (node.is_terminal(goal)) {
                 Record terminal;
                 terminal.progress = goal_progress(node.biscuit, goal);
                 terminal.bg = node.bg;
@@ -380,6 +390,7 @@ struct MCTSTree {
                 terminal.bg_spent = initial_bg - node.bg;
                 terminal.bl_spent = initial_bl - node.bl;
                 terminal.decision_step = depth;
+                // 1=명시적 자발 STOP, 2=합법적인 리롤 행동이 더 이상 없음.
                 terminal.terminal_reason = node.stopped ? 1 : 2;
                 for (const auto& slot : node.biscuit) {
                     const int tier = get_tier(slot.opt_idx, slot.val);
@@ -578,7 +589,7 @@ struct MCTSConfig {
     std::string output_path = "";
 };
 
-// 반환: 0 = 범위 전체 완료, EXIT_INTERRUPTED = 중단(재개 필요), 1 = I/O 오류
+// 반환: 0 = 범위 전체 완료, EXIT_INTERRUPTED = 종료 신호로 중단, 1 = I/O 오류
 int run_mcts_pipeline(const MCTSConfig& cfg)
 {
     auto inits = generate_inits(cfg.init_biscuit, cfg.n_starts);
