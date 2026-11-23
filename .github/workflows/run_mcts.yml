@@ -64,7 +64,7 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     # 같은 (tier, goal, chunk) 는 동시에 하나만. 재디스패치된 run 은 현재 job 이 끝날 때까지 대기.
     concurrency:
-      group: mcts-v2-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
+      group: mcts-v3-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
       cancel-in-progress: false
     env:
       TIER: ${{ inputs.tier }}
@@ -73,7 +73,7 @@ jobs:
       CHUNK_SIZE: ${{ inputs.chunk_size }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      ARTIFACT_NAME: mcts-v2-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
+      ARTIFACT_NAME: mcts-v3-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
