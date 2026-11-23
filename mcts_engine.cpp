@@ -57,9 +57,11 @@ void build_opt_vals() {
 struct FastRNG {
     using result_type = uint64_t;
     uint64_t s[2];
-    explicit FastRNG(uint64_t seed) {
+    explicit FastRNG(uint64_t seed) { reseed(seed); }
+    inline void reseed(uint64_t seed) {
         s[0] = seed ^ 0x6C0789651D230094ULL;
         s[1] = (seed * 13137ULL) ^ 0x9E3779B97F4A7C15ULL;
+        if ((s[0] | s[1]) == 0) s[1] = 1;
     }
     inline result_type operator()() {
         uint64_t s1 = s[0]; const uint64_t s0 = s[1];
@@ -76,6 +78,13 @@ struct FastRNG {
     }
 };
 thread_local FastRNG tl_rng{ std::random_device{}() };
+
+inline uint64_t mix_seed(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
 
 // ── 슬롯 / 비스킷 / 목표 ──────────────────────────────────
 struct Slot { int opt_idx; float val; };
@@ -229,6 +238,7 @@ struct Record {
     int matched_count = 0, goal_achieved = 0;
     int bg_spent = 0, bl_spent = 0, decision_step = 0;
     int terminal_reason = 0; // 0=decision, 1=voluntary stop, 2=no legal continuation
+    uint64_t rng_seed = 0;
 };
 
 struct MCTSTree {
@@ -547,7 +557,7 @@ static const std::string CSV_HEADER =
 "best_action,best_q,q_general,q_light_avg,"
 "goal_id,resource_tier,biscuit_id,matched_at_switch,bl_remaining_at_switch,"
 "q_stop,q_continue,biscuit_score,matched_count,goal_achieved,"
-"bg_spent,bl_spent,decision_step,terminal_reason\n";
+"bg_spent,bl_spent,decision_step,terminal_reason,rng_seed\n";
 
 static constexpr int EXIT_INTERRUPTED = 75;       // SIGINT/SIGTERM 안전 종료
 
@@ -556,9 +566,10 @@ static std::atomic<bool> g_stop{ false };
 static_assert(std::atomic<bool>::is_always_lock_free, "signal handler requires lock-free atomic");
 extern "C" void on_signal(int) { g_stop.store(true, std::memory_order_relaxed); }
 
-std::vector<Biscuit> generate_inits(const Biscuit& base, int n, bool has_attribute_damage) {
+std::vector<Biscuit> generate_inits(const Biscuit& base, int n, bool has_attribute_damage, uint64_t base_seed) {
     std::vector<Biscuit> inits(n);
     for (int i = 0; i < n; ++i) {
+        tl_rng.reseed(mix_seed(base_seed ^ static_cast<uint64_t>(i) ^ 0x494E495449414CULL));
         if (i % 3 == 0) {
             for (int p = 0; p < 4; ++p) {
                 int opt = tl_rng.next_int(has_attribute_damage ? N_OPTS : N_OPTS - 1);
@@ -588,6 +599,7 @@ struct MCTSConfig {
     int n_starts = 100000;
     int n_sim = 500;
     int max_rollout = 300;
+    uint64_t seed = 20261123ULL;
     int goal_id = 0;
     int resource_tier = 0;
     int id_start = 0;      // 처리할 biscuit_id 범위 [id_start, id_end)
@@ -600,7 +612,7 @@ int run_mcts_pipeline(const MCTSConfig& cfg)
 {
     const bool has_attribute_damage = std::any_of(cfg.goal.begin(), cfg.goal.end(),
         [](const GoalEntry& entry) { return entry.opt_idx == 11; });
-    auto inits = generate_inits(cfg.init_biscuit, cfg.n_starts, has_attribute_damage);
+    auto inits = generate_inits(cfg.init_biscuit, cfg.n_starts, has_attribute_damage, cfg.seed);
 
     const int total = cfg.id_end - cfg.id_start;
 
@@ -640,7 +652,8 @@ int run_mcts_pipeline(const MCTSConfig& cfg)
                   << "," << r.q_stop << "," << r.q_continue << "," << r.score
                   << "," << r.matched_count << "," << r.goal_achieved
                   << "," << r.bg_spent << "," << r.bl_spent
-                  << "," << r.decision_step << "," << r.terminal_reason << "\n";
+                  << "," << r.decision_step << "," << r.terminal_reason
+                  << "," << r.rng_seed << "\n";
             }
             f.flush();
         };
@@ -697,6 +710,8 @@ int run_mcts_pipeline(const MCTSConfig& cfg)
                 if (i >= cfg.id_end) break;
 
                 local_node_pool.clear();
+                const uint64_t biscuit_seed = mix_seed(cfg.seed ^ static_cast<uint64_t>(i) ^ 0x534541524348ULL);
+                tl_rng.reseed(biscuit_seed);
                 MCTSTree tree(local_node_pool, inits[i],
                     cfg.budget_g, cfg.budget_l, cfg.goal, cfg.max_rollout);
                 tree.run(cfg.n_sim);
@@ -707,6 +722,7 @@ int run_mcts_pipeline(const MCTSConfig& cfg)
                         r.goal_id = cfg.goal_id;
                         r.resource_tier = cfg.resource_tier;
                         r.biscuit_id = i;
+                        r.rng_seed = mix_seed(cfg.seed ^ static_cast<uint64_t>(i) ^ 0x534541524348ULL);
 
                         while (!queue->push(r)) {
                             if (io_failed.load(std::memory_order_acquire)) return;
@@ -748,7 +764,8 @@ static void print_usage() {
         "  --id_end E          biscuit_id 끝, 미포함 (기본 n_starts)\n"
         "  --out PATH          출력 CSV (--tier/--goal 둘 다 지정 시에만 사용)\n"
         "  --n_starts N        기본 100000\n"
-        "  --n_sim N           기본 500\n";
+        "  --n_sim N           기본 500\n"
+        "  --seed N            재현 가능한 64-bit seed\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -782,6 +799,7 @@ int main(int argc, char* argv[]) {
     int tier_filter = -1, goal_filter = -1;
     int id_start = 0, id_end = -1;
     int n_starts = 100000, n_sim = 500;
+    uint64_t base_seed = 20261123ULL;
     std::string out_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -802,6 +820,7 @@ int main(int argc, char* argv[]) {
             else if (a == "--out")            out_path = need();
             else if (a == "--n_starts")       n_starts = std::stoi(need());
             else if (a == "--n_sim")          n_sim = std::stoi(need());
+            else if (a == "--seed")            base_seed = std::stoull(need());
             else { std::cerr << "[Error] 알 수 없는 인자: " << a << "\n"; print_usage(); return 2; }
         } catch (const std::exception&) {
             std::cerr << "[Error] 잘못된 값: " << a << "\n";
@@ -844,6 +863,7 @@ int main(int argc, char* argv[]) {
             cfg.max_rollout = TIERS[ti].bg + TIERS[ti].bl;
             cfg.n_starts = n_starts;
             cfg.n_sim = n_sim;
+            cfg.seed = base_seed;
             cfg.id_start = id_start;
             cfg.id_end = id_end;
             cfg.output_path = filename;
