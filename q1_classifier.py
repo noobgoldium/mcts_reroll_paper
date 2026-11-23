@@ -44,39 +44,27 @@ def load_csvs(csv_dir: str) -> pd.DataFrame:
 
 # ── 전처리 ────────────────────────────────────────────────────────────────────
 FEATURE_COLS = [
-    "resource_tier",   # 자원 구간 0~4
-    "goal_id",         # 목표 인덱스 0~9
-    "progress",        # 현재 진행도
-    "matched_count",   # 현재 매칭된 목표 슬롯 수
-    "budget_g",        # 남은 일반 비스킷 예산
-    "budget_l",        # 남은 빛도우 예산
-    "tier_0", "tier_1", "tier_2", "tier_3", "tier_4",  # 현재 슬롯 티어 분포
+    "resource_tier",
+    "goal_id",
+    "state_progress_mean",
+    "state_matched_mean",
+    "state_bg_mean",
+    "state_bl_mean",
+    "state_score_mean",
 ]
-# opt0~11_tier 중 최대값을 feature로 추가
-OPT_COLS = [f"opt{i}_tier" for i in range(12)]
 
 TARGET_COL = "best_action"
 
 def preprocess(df: pd.DataFrame):
-    # opt 최대티어
-    existing_opt = [c for c in OPT_COLS if c in df.columns]
-    if existing_opt:
-        df["opt_max_tier"] = df[existing_opt].max(axis=1)
-    else:
-        df["opt_max_tier"] = 0.0
-
-    feat_cols = FEATURE_COLS + ["opt_max_tier"]
-    missing = [c for c in feat_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"컬럼 없음: {missing}")
-
-    required = feat_cols + [TARGET_COL, "goal_id", "resource_tier", "biscuit_id"]
+    feat_cols = FEATURE_COLS
+    required = feat_cols + [TARGET_COL, "goal_id", "resource_tier", "biscuit_id", "state_samples"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"컬럼 없음: {missing}")
 
     # 종료 레코드는 의사결정 행동 분류의 학습 대상에서 제외한다.
     df = df.dropna(subset=required).copy()
+    df = df[df["state_samples"] > 0]
     if "terminal_reason" in df.columns:
         df = df[df["terminal_reason"] == 0]
     df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce")
