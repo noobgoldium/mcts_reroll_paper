@@ -752,7 +752,7 @@ int run_q1_compare(
 
     std::ofstream out(output_path, std::ios::trunc);
     if (!out) {
-        std::cerr << "[Error] Q1 출력 파일 생성 실패: " << output_path << "\\n";
+        std::cerr << "[Error] Q1 출력 파일 생성 실패: " << output_path << "\n";
         return 1;
     }
     out << "goal_id,resource_tier,biscuit_id,base_seed,policy,initial_matched,"
@@ -761,7 +761,7 @@ int run_q1_compare(
            "bg_remaining,bl_remaining,reroll_steps,initial_score,final_score,"
            "initial_opt0,initial_val0,initial_opt1,initial_val1,initial_opt2,initial_val2,"
            "initial_opt3,initial_val3,final_opt0,final_val0,final_opt1,final_val1,"
-           "final_opt2,final_val2,final_opt3,final_val3\\n";
+           "final_opt2,final_val2,final_opt3,final_val3\n";
 
     for (int local = 0; local < id_end - id_start; ++local) {
         if (g_stop.load(std::memory_order_relaxed)) return EXIT_INTERRUPTED;
@@ -794,15 +794,15 @@ int run_q1_compare(
                 out << ',' << slot.opt_idx << ',' << slot.val;
             for (const auto& slot : r.final_biscuit)
                 out << ',' << slot.opt_idx << ',' << slot.val;
-            out << '\\n';
+            out << '\n';
         }
     }
     out.flush();
     if (!out) {
-        std::cerr << "[Error] Q1 CSV 기록 실패: " << output_path << "\\n";
+        std::cerr << "[Error] Q1 CSV 기록 실패: " << output_path << "\n";
         return 1;
     }
-    std::cout << "[Q1] paired policies written: " << output_path << "\\n";
+    std::cout << "[Q1] paired policies written: " << output_path << "\n";
     return 0;
 }
 
