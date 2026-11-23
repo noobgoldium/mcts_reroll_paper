@@ -31,6 +31,51 @@ jobs:
           ./mcts_engine --tier 0 --goal 0 --n_starts 2 --n_sim 100 --id_start 0 --id_end 1 --seed 123456 --out out/smoke_repeat.csv
           cmp out/smoke.csv out/smoke_repeat.csv
           python3 -m py_compile q1_classifier.py q2_regression.py
+          ./mcts_engine --tier 0 --goal 0 --n_starts 30 --id_start 0 --id_end 30 --seed 123456 --q1_compare --q1_out out/q1_smoke.csv
+          python3 - <<'PY'
+          import csv
+          from collections import defaultdict
+          with open("out/q1_smoke.csv", newline="") as f:
+              rows = list(csv.DictReader(f))
+          assert len(rows) == 60, f"expected 60 paired policy rows, got {len(rows)}"
+          paired = defaultdict(list)
+          for row in rows:
+              paired[row["biscuit_id"]].append(row)
+          assert len(paired) == 30
+          for biscuit_id, pair in paired.items():
+              assert {r["policy"] for r in pair} == {"Q1-A", "Q1-B"}
+              a, b = sorted(pair, key=lambda r: r["policy"])
+              initial_cols = [f"initial_{name}" for i in range(4) for name in (f"opt{i}", f"val{i}")]
+              assert all(a[c] == b[c] for c in initial_cols), f"unpaired initial biscuit {biscuit_id}"
+          print(f"validated {len(rows)} Q1 rows across {len(paired)} paired biscuits")
+          PY
+          mkdir -p out/q2_synthetic
+          python3 - <<'PY'
+          import csv, math, random
+          random.seed(7)
+          fields = [
+              "resource_tier","goal_id","state_bl_mean","state_progress_mean",
+              "state_matched_mean","state_score_mean","q_stop","q_continue",
+              "terminal_reason","state_samples","state_matched_min","biscuit_id","decision_step"
+          ]
+          with open("out/q2_synthetic/biscuit_tier_0_goal_0.csv","w",newline="") as f:
+              w = csv.DictWriter(f,fieldnames=fields); w.writeheader()
+              for biscuit in range(80):
+                  n = 2 + biscuit % 8
+                  for step, score in enumerate((20,60,100,140)):
+                      stop = 0.4
+                      cont = max(0.01, 0.6 - score / 400.0)
+                      w.writerow({
+                          "resource_tier":0,"goal_id":0,"state_bl_mean":n,
+                          "state_progress_mean":0.5,"state_matched_mean":2.5,
+                          "state_score_mean":score,"q_stop":stop,"q_continue":cont,
+                          "terminal_reason":0,"state_samples":100,
+                          "state_matched_min":2,"biscuit_id":biscuit,
+                          "decision_step":step
+                      })
+          PY
+          python3 q2_regression.py --csv-dir out/q2_synthetic --bootstrap 100 --min-groups-per-bin 2 --output-prefix out/q2_smoke
+          test -s out/q2_smoke_threshold_summary.csv
 
       - name: Validate new CSV schema and terminal records
         run: |
