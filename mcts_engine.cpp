@@ -182,6 +182,29 @@ inline float compute_reward(const Biscuit& b, const Goal& goal, bool success) {
 // ── MCTS ──────────────────────────────────────────────────
 static const int N_ACTIONS = 5;
 
+// 세 행동 제약을 트리 탐색과 롤아웃에서 공유한다.
+// action 0: 일반도우, action 1..4: 각 슬롯의 빛도우.
+inline int count_matched_slots(const std::array<bool, 4>& matched) {
+    int count = 0;
+    for (bool m : matched) if (m) ++count;
+    return count;
+}
+
+inline bool is_action_legal(
+    const Biscuit& biscuit, int bg, int bl, const Goal& goal, int action)
+{
+    if (action < 0 || action >= N_ACTIONS) return false;
+
+    const auto matched = get_matched_slots(biscuit, goal);
+    const int matched_count = count_matched_slots(matched);
+
+    if (action == 0)
+        return bg >= 1 && matched_count < 2;
+
+    const int pos = action - 1;
+    return bl >= 1 && matched_count > 0 && !matched[static_cast<size_t>(pos)];
+}
+
 struct Node {
     Biscuit biscuit{};
     int bg = 0, bl = 0, parent = -1, action = -1;
@@ -201,8 +224,8 @@ struct Record {
     int goal_id = -1;
     int resource_tier = -1;
     int biscuit_id = -1;
-    int matched_at_switch = 0;
-    int bl_remaining_at_switch = 0;
+    int matched_at_switch = -1; // 최적 경로의 첫 빛도우 행동 직전 매칭 슬롯 수
+    int bl_remaining_at_switch = -1; // 해당 행동 직전 남은 빛도우 수
 };
 
 struct MCTSTree {
@@ -242,14 +265,15 @@ struct MCTSTree {
             const Node& n = nodes[idx];
             bool has_untried = false;
             for (int a = 0; a < N_ACTIONS; ++a)
-                if (n.untried[a] && n.can_act(a)) {
+                if (n.untried[a] &&
+                    is_action_legal(n.biscuit, n.bg, n.bl, goal, a)) {
                     has_untried = true; break;
                 }
             if (has_untried) return idx;
             int best_a = -1; float best_u = -1.0f;
             float log_p = std::log(static_cast<float>(n.visits));
             for (int a = 0; a < N_ACTIONS; ++a) {
-                if (!n.can_act(a)) continue;
+                if (!is_action_legal(n.biscuit, n.bg, n.bl, goal, a)) continue;
                 float u = ucb1(idx, a, log_p);
                 if (u > best_u) { best_u = u; best_a = a; }
             }
@@ -261,31 +285,11 @@ struct MCTSTree {
 
     int expand(int idx) {
         Node& node = nodes[idx];
-        bool has_goal_slot = false;
-        for (const auto& s : node.biscuit) {
-            for (const auto& g : goal) {
-                if (s.opt_idx == g.opt_idx &&
-                    get_tier(s.opt_idx, s.val) >= g.min_tier) {
-                    has_goal_slot = true; break;
-                }
-            }
-            if (has_goal_slot) break;
-        }
-        std::array<int, N_ACTIONS> acts{}; int n_acts = 0;
+        std::array<int, N_ACTIONS> acts{};
+        int n_acts = 0;
         for (int a = 0; a < N_ACTIONS; ++a) {
-            if (!node.untried[a] || !node.can_act(a)) continue;
-            if (a >= 1 && !has_goal_slot) continue;
-            if (a >= 1) {
-                int pos = a - 1;
-                bool is_goal_slot = false;
-                for (const auto& g : goal) {
-                    if (node.biscuit[pos].opt_idx == g.opt_idx &&
-                        get_tier(node.biscuit[pos].opt_idx, node.biscuit[pos].val) >= g.min_tier) {
-                        is_goal_slot = true; break;
-                    }
-                }
-                if (is_goal_slot) continue;
-            }
+            if (!node.untried[a]) continue;
+            if (!is_action_legal(node.biscuit, node.bg, node.bl, goal, a)) continue;
             acts[n_acts++] = a;
         }
         if (n_acts == 0) return idx;
@@ -323,13 +327,23 @@ struct MCTSTree {
             int unmatched_cnt = 0;
             for (int i = 0; i < 4; ++i)
                 if (!matched[i]) unmatched_actions[unmatched_cnt++] = i + 1;
-            float prog = static_cast<float>(4 - unmatched_cnt) * 0.25f;
-            if (bl >= 1 && unmatched_cnt > 0 && (prog >= 0.5f || bg < 1))
-                a = unmatched_actions[tl_rng.next_int(unmatched_cnt)];
+
+            // 세 제약을 롤아웃에서도 강제한다.
+            // 0개 매칭: 빛도우 금지 → 일반도우만 가능.
+            // 2개 이상 매칭: 일반도우 금지 → 빛도우만 가능.
+            // 빛도우는 실제로 매칭 처리된 슬롯에는 사용할 수 없다.
+            if (matched_count == 0) {
+                if (bg >= 1) a = 0;
+                else break;
+            }
+            else if (matched_count >= 2) {
+                if (bl >= 1 && unmatched_cnt > 0)
+                    a = unmatched_actions[tl_rng.next_int(unmatched_cnt)];
+                else break;
+            }
             else if (bg >= 1 && bl >= 1) {
                 if (tl_rng.next_int(10) < 8) a = 0;
-                else if (unmatched_cnt > 0) a = unmatched_actions[tl_rng.next_int(unmatched_cnt)];
-                else a = 0;
+                else a = unmatched_actions[tl_rng.next_int(unmatched_cnt)];
             }
             else if (bg >= 1) a = 0;
             else if (bl >= 1 && unmatched_cnt > 0)
@@ -360,6 +374,8 @@ struct MCTSTree {
 
     std::vector<Record> extract_records(int max_depth = 200) {
         std::vector<Record> recs;
+        int switch_matched = -1;
+        int switch_bl_remaining = -1;
         int idx = 0;
         for (int depth = 0; depth < max_depth; ++depth) {
             const Node& node = nodes[idx];
@@ -396,10 +412,23 @@ struct MCTSTree {
                 int& mx = rec.opt_max_tier[s.opt_idx];
                 if (t > mx) mx = t;
             }
+            if (best_a >= 1 && switch_matched < 0) {
+                const auto matched = get_matched_slots(node.biscuit, goal);
+                switch_matched = count_matched_slots(matched);
+                switch_bl_remaining = node.bl;
+            }
             recs.push_back(rec);
             int ci = node.children[best_a];
             if (ci < 0) break;
             idx = ci;
+        }
+        // 첫 빛도우 행동이 있는 경우, 해당 전환 시점 정보를 경로 전체에 기록한다.
+        // 전환이 없으면 -1을 유지해 실제 0개와 구분한다.
+        if (switch_matched >= 0) {
+            for (auto& rec : recs) {
+                rec.matched_at_switch = switch_matched;
+                rec.bl_remaining_at_switch = switch_bl_remaining;
+            }
         }
         return recs;
     }
