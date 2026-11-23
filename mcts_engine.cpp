@@ -532,8 +532,6 @@ static const std::string CSV_HEADER =
 "q_stop,q_continue,biscuit_score,matched_count,goal_achieved,"
 "bg_spent,bl_spent,decision_step,terminal_reason\n";
 
-static constexpr size_t CSV_NCOLS = 38;
-static constexpr size_t CSV_BISCUIT_ID_COL = 26;
 static constexpr int EXIT_INTERRUPTED = 75;       // SIGINT/SIGTERM 안전 종료
 
 // 종료 요청 플래그 (SIGINT/SIGTERM 핸들러에서 설정)
