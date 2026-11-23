@@ -25,6 +25,14 @@ on:
         description: "재현 가능한 실험 seed (모든 matrix job에 공통 적용)"
         required: true
         default: "20261123"
+      experiment:
+        description: "실험 유형"
+        type: choice
+        options:
+          - mcts
+          - q1_compare
+        required: true
+        default: mcts
 
 permissions:
   contents: read
@@ -43,6 +51,7 @@ jobs:
           CHUNKS: ${{ inputs.chunks }}
           CHUNK_SIZE: ${{ inputs.chunk_size }}
           SEED: ${{ inputs.seed }}
+          EXPERIMENT: ${{ inputs.experiment }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -84,7 +93,8 @@ jobs:
       CHUNK: ${{ matrix.chunk }}
       CHUNK_SIZE: ${{ inputs.chunk_size }}
       SEED: ${{ inputs.seed }}
-      ARTIFACT_NAME: mcts-matrix-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
+      EXPERIMENT: ${{ inputs.experiment }}
+      ARTIFACT_NAME: ${{ inputs.experiment }}-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -107,11 +117,19 @@ jobs:
           # TERM을 보내 엔진이 현재 biscuit 처리를 마친 뒤 종료할 기회를 준다.
           # 시간 초과 시 job은 실패로 표시되며, 산출물은 진단용으로 업로드한다.
           set +e
-          timeout --signal=TERM --kill-after=5m 120m ./mcts_engine \
-            --tier "$TIER" --goal "$GOAL" \
-            --id_start "$ID_START" --id_end "$ID_END" \
-            --seed "$SEED" \
-            --out "out/biscuit_tier_${TIER}_goal_${GOAL}_chunk_${CHUNK}.csv"
+          if [ "$EXPERIMENT" = "q1_compare" ]; then
+            timeout --signal=TERM --kill-after=5m 120m ./mcts_engine \
+              --tier "$TIER" --goal "$GOAL" \
+              --id_start "$ID_START" --id_end "$ID_END" \
+              --seed "$SEED" --q1_compare \
+              --q1_out "out/q1_policy_tier_${TIER}_goal_${GOAL}_chunk_${CHUNK}.csv"
+          else
+            timeout --signal=TERM --kill-after=5m 120m ./mcts_engine \
+              --tier "$TIER" --goal "$GOAL" \
+              --id_start "$ID_START" --id_end "$ID_END" \
+              --seed "$SEED" \
+              --out "out/biscuit_tier_${TIER}_goal_${GOAL}_chunk_${CHUNK}.csv"
+          fi
           rc=$?
           set -e
 
