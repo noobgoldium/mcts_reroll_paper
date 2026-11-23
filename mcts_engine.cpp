@@ -241,6 +241,8 @@ struct Record {
     int matched_at_switch = -1;
     int bl_remaining_at_switch = -1;
     float q_stop = -1.0f, q_continue = -1.0f, score = 0.0f;
+    uint64_t q_stop_visits = 0, q_continue_visits = 0;
+    int q_continue_action = -1;
     int matched_count = 0, goal_achieved = 0;
     int bg_spent = 0, bl_spent = 0, decision_step = 0;
     int terminal_reason = 0; // 0=decision, 1=voluntary stop, 2=no legal continuation
@@ -472,9 +474,15 @@ struct MCTSTree {
                 if (ci < 0 || nodes[ci].visits == 0) continue;
                 const float q = nodes[ci].value / static_cast<float>(nodes[ci].visits);
                 if (q > best_q) { best_q = q; best_action = a; }
-                if (a == ACTION_STOP) rec.q_stop = q;
-                else {
-                    if (q > rec.q_continue) rec.q_continue = q;
+                if (a == ACTION_STOP) {
+                    rec.q_stop = q;
+                    rec.q_stop_visits = static_cast<uint64_t>(nodes[ci].visits);
+                } else {
+                    if (q > rec.q_continue) {
+                        rec.q_continue = q;
+                        rec.q_continue_visits = static_cast<uint64_t>(nodes[ci].visits);
+                        rec.q_continue_action = a;
+                    }
                     if (a == ACTION_GENERAL) rec.q_general = q;
                     else { q_light_sum += q; ++q_light_count; }
                 }
@@ -603,7 +611,7 @@ static const std::string CSV_HEADER =
 "q_stop,q_continue,biscuit_score,matched_count,goal_achieved,"
 "bg_spent,bl_spent,decision_step,terminal_reason,rng_seed,"
 "state_samples,state_progress_mean,state_matched_mean,state_bg_mean,state_bl_mean,state_score_mean,"
-"state_matched_min,state_matched_max\n";
+"state_matched_min,state_matched_max,q_stop_visits,q_continue_visits,q_continue_action\n";
 
 static constexpr int EXIT_INTERRUPTED = 75;       // SIGINT/SIGTERM 안전 종료
 
@@ -914,7 +922,8 @@ int run_mcts_pipeline(const MCTSConfig& cfg)
                   << "," << r.state_progress_mean << "," << r.state_matched_mean
                   << "," << r.state_bg_mean << "," << r.state_bl_mean
                   << "," << r.state_score_mean << "," << r.state_matched_min
-                  << "," << r.state_matched_max << "\n";
+                  << "," << r.state_matched_max << "," << r.q_stop_visits
+                  << "," << r.q_continue_visits << "," << r.q_continue_action << "\n";
             }
             f.flush();
         };
