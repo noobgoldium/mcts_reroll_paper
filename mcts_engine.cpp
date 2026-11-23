@@ -146,21 +146,22 @@ inline float biscuit_score(const Biscuit& b) {
     return t;
 }
 
-inline Slot sample_slot() {
-    int opt = tl_rng.next_int(N_OPTS);
-    int idx = tl_rng.next_int(OPT_SIZES[opt]);
-    return { opt, OPT_VALS[opt][idx] };
+inline Slot sample_slot(bool has_attribute_damage) {
+    const int option_count = has_attribute_damage ? N_OPTS : N_OPTS - 1;
+    const int opt = tl_rng.next_int(option_count);
+    const int idx = tl_rng.next_int(OPT_SIZES[opt]);
+    return { opt, OPT_VALS[opt][static_cast<size_t>(idx)] };
 }
 
-inline Biscuit reroll_general(const Biscuit&) {
+inline Biscuit reroll_general(const Biscuit&, bool has_attribute_damage) {
     Biscuit nb;
-    for (auto& s : nb) s = sample_slot();
+    for (auto& s : nb) s = sample_slot(has_attribute_damage);
     return nb;
 }
 
-inline Biscuit reroll_light(const Biscuit& b, int pos) {
+inline Biscuit reroll_light(const Biscuit& b, int pos, bool has_attribute_damage) {
     Biscuit nb = b;
-    nb[pos] = sample_slot();
+    nb[static_cast<size_t>(pos)] = sample_slot(has_attribute_damage);
     return nb;
 }
 
@@ -241,10 +242,13 @@ struct MCTSTree {
     const Goal& goal;
     int max_rollout;
     int initial_bg, initial_bl;
+    bool has_attribute_damage;
 
     MCTSTree(std::vector<Node>& pool, const Biscuit& init,
         int bg, int bl, const Goal& g, int mr)
-        : nodes(pool), goal(g), max_rollout(mr), initial_bg(bg), initial_bl(bl)
+        : nodes(pool), goal(g), max_rollout(mr), initial_bg(bg), initial_bl(bl),
+          has_attribute_damage(std::any_of(g.begin(), g.end(),
+              [](const GoalEntry& entry) { return entry.opt_idx == 11; }))
     {
         Node root;
         root.biscuit = init; root.bg = bg; root.bl = bl;
@@ -307,11 +311,11 @@ struct MCTSTree {
         Biscuit nb = node.biscuit;
         int new_bg = node.bg, new_bl = node.bl;
         if (a == ACTION_GENERAL) {
-            nb = reroll_general(node.biscuit);
+            nb = reroll_general(node.biscuit, has_attribute_damage);
             --new_bg;
         }
         else if (a >= ACTION_LIGHT_FIRST && a <= ACTION_LIGHT_LAST) {
-            nb = reroll_light(node.biscuit, a - ACTION_LIGHT_FIRST);
+            nb = reroll_light(node.biscuit, a - ACTION_LIGHT_FIRST, has_attribute_damage);
             --new_bl;
         }
         int ci = new_node(nb, new_bg, new_bl, idx, a);
@@ -344,11 +348,11 @@ struct MCTSTree {
             // 트리의 명시적 STOP action에서만 평가한다.
             const int a = legal[tl_rng.next_int(legal_count)];
             if (a == ACTION_GENERAL) {
-                b = reroll_general(b);
+                b = reroll_general(b, has_attribute_damage);
                 --bg;
             }
             else {
-                b = reroll_light(b, a - ACTION_LIGHT_FIRST);
+                b = reroll_light(b, a - ACTION_LIGHT_FIRST, has_attribute_damage);
                 --bl;
             }
         }
@@ -550,12 +554,12 @@ static std::atomic<bool> g_stop{ false };
 static_assert(std::atomic<bool>::is_always_lock_free, "signal handler requires lock-free atomic");
 extern "C" void on_signal(int) { g_stop.store(true, std::memory_order_relaxed); }
 
-std::vector<Biscuit> generate_inits(const Biscuit& base, int n) {
+std::vector<Biscuit> generate_inits(const Biscuit& base, int n, bool has_attribute_damage) {
     std::vector<Biscuit> inits(n);
     for (int i = 0; i < n; ++i) {
         if (i % 3 == 0) {
             for (int p = 0; p < 4; ++p) {
-                int opt = tl_rng.next_int(N_OPTS);
+                int opt = tl_rng.next_int(has_attribute_damage ? N_OPTS : N_OPTS - 1);
                 int vidx = tl_rng.next_int(OPT_SIZES[opt]);
                 inits[i][p] = { opt, OPT_VALS[opt][vidx] };
             }
@@ -592,7 +596,9 @@ struct MCTSConfig {
 // 반환: 0 = 범위 전체 완료, EXIT_INTERRUPTED = 종료 신호로 중단, 1 = I/O 오류
 int run_mcts_pipeline(const MCTSConfig& cfg)
 {
-    auto inits = generate_inits(cfg.init_biscuit, cfg.n_starts);
+    const bool has_attribute_damage = std::any_of(cfg.goal.begin(), cfg.goal.end(),
+        [](const GoalEntry& entry) { return entry.opt_idx == 11; });
+    auto inits = generate_inits(cfg.init_biscuit, cfg.n_starts, has_attribute_damage);
 
     const int total = cfg.id_end - cfg.id_start;
 
