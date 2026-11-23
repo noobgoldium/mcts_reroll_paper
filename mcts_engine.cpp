@@ -639,6 +639,173 @@ std::vector<Biscuit> generate_inits(const Biscuit& base, int id_start, int id_en
     return inits;
 }
 
+
+struct Q1PolicyResult {
+    int policy = 0;
+    int switch_matched = -1;
+    int switch_bl_remaining = -1;
+    int switch_reason = 0; // 0=threshold, 1=forced by general-dough exhaustion
+    int achieved = 0;
+    int terminal_reason = 0; // 1=goal, 2=no legal action, 3=no unmatched slot
+    int bg_spent = 0, bl_spent = 0, steps = 0;
+    Biscuit final_biscuit{};
+    int final_bg = 0, final_bl = 0;
+};
+
+Q1PolicyResult simulate_q1_policy(
+    const Biscuit& initial, const Goal& goal, int initial_bg, int initial_bl,
+    bool has_attribute_damage, int switch_threshold, uint64_t policy_seed)
+{
+    Q1PolicyResult result;
+    result.policy = switch_threshold;
+    result.final_biscuit = initial;
+    result.final_bg = initial_bg;
+    result.final_bl = initial_bl;
+    tl_rng.reseed(policy_seed);
+
+    bool switched = false;
+    const int max_steps = initial_bg + initial_bl + 1;
+    for (int step = 0; step < max_steps; ++step) {
+        Biscuit& b = result.final_biscuit;
+        int& bg = result.final_bg;
+        int& bl = result.final_bl;
+
+        if (check_goal(b, goal)) {
+            result.achieved = 1;
+            result.terminal_reason = 1;
+            break;
+        }
+
+        const int matched_count =
+            count_matched_slots(get_matched_slots(b, goal));
+
+        if (!switched) {
+            if (matched_count >= switch_threshold) {
+                switched = true;
+                result.switch_matched = matched_count;
+                result.switch_bl_remaining = bl;
+                result.switch_reason = 0;
+            } else if (bg > 0 && matched_count < 2) {
+                b = reroll_general(b, has_attribute_damage);
+                --bg;
+                ++result.bg_spent;
+                ++result.steps;
+                continue;
+            } else if (matched_count > 0 && bl > 0) {
+                // General dough is exhausted before the target threshold.
+                // Switch to light dough rather than silently changing policy.
+                switched = true;
+                result.switch_matched = matched_count;
+                result.switch_bl_remaining = bl;
+                result.switch_reason = 1;
+            } else {
+                result.terminal_reason = 2;
+                break;
+            }
+        }
+
+        if (bl <= 0 || matched_count <= 0) {
+            result.terminal_reason = 2;
+            break;
+        }
+
+        const auto matched = get_matched_slots(b, goal);
+        std::array<int, 4> candidates{};
+        int candidate_count = 0;
+        for (int pos = 0; pos < 4; ++pos)
+            if (!matched[static_cast<size_t>(pos)])
+                candidates[candidate_count++] = pos;
+
+        if (candidate_count == 0) {
+            result.achieved = check_goal(b, goal) ? 1 : 0;
+            result.terminal_reason = result.achieved ? 1 : 3;
+            break;
+        }
+
+        const int pos = candidates[tl_rng.next_int(candidate_count)];
+        b = reroll_light(b, pos, has_attribute_damage);
+        --bl;
+        ++result.bl_spent;
+        ++result.steps;
+    }
+
+    if (check_goal(result.final_biscuit, goal)) {
+        result.achieved = 1;
+        result.terminal_reason = 1;
+    } else if (result.terminal_reason == 0) {
+        result.terminal_reason = 2;
+    }
+    return result;
+}
+
+int run_q1_compare(
+    const Goal& goal, int goal_id, int resource_tier, int initial_bg, int initial_bl,
+    int id_start, int id_end, uint64_t base_seed, const std::string& output_path)
+{
+    const bool has_attribute_damage = std::any_of(goal.begin(), goal.end(),
+        [](const GoalEntry& entry) { return entry.opt_idx == 11; });
+    const Biscuit base = {
+        Slot{ 0, 3.0f }, Slot{ 1, 5.0f }, Slot{ 3, 3.0f }, Slot{ 4, 3.0f }
+    };
+    const auto initials = generate_inits(
+        base, id_start, id_end, has_attribute_damage, base_seed);
+
+    std::ofstream out(output_path, std::ios::trunc);
+    if (!out) {
+        std::cerr << "[Error] Q1 출력 파일 생성 실패: " << output_path << "\\n";
+        return 1;
+    }
+    out << "goal_id,resource_tier,biscuit_id,base_seed,policy,initial_matched,"
+           "switch_threshold,switch_matched,switch_bl_remaining,switch_reason,"
+           "goal_achieved,terminal_reason,bg_initial,bl_initial,bg_spent,bl_spent,"
+           "bg_remaining,bl_remaining,reroll_steps,initial_score,final_score,"
+           "initial_opt0,initial_val0,initial_opt1,initial_val1,initial_opt2,initial_val2,"
+           "initial_opt3,initial_val3,final_opt0,final_val0,final_opt1,final_val1,"
+           "final_opt2,final_val2,final_opt3,final_val3\\n";
+
+    for (int local = 0; local < id_end - id_start; ++local) {
+        if (g_stop.load(std::memory_order_relaxed)) return EXIT_INTERRUPTED;
+        const int id = id_start + local;
+        const Biscuit& initial = initials[static_cast<size_t>(local)];
+        const int initial_matched =
+            count_matched_slots(get_matched_slots(initial, goal));
+        const uint64_t init_seed = mix_seed(
+            base_seed ^ static_cast<uint64_t>(id) ^ 0x494E495449414CULL);
+
+        for (int threshold : { 1, 2 }) {
+            const uint64_t policy_seed = mix_seed(
+                base_seed ^ static_cast<uint64_t>(id) ^
+                (threshold == 1 ? 0x513141ULL : 0x513142ULL));
+            const auto r = simulate_q1_policy(
+                initial, goal, initial_bg, initial_bl,
+                has_attribute_damage, threshold, policy_seed);
+
+            out << goal_id << ',' << resource_tier << ',' << id << ','
+                << init_seed << ',' << (threshold == 1 ? "Q1-A" : "Q1-B") << ','
+                << initial_matched << ',' << threshold << ','
+                << r.switch_matched << ',' << r.switch_bl_remaining << ','
+                << r.switch_reason << ',' << r.achieved << ','
+                << r.terminal_reason << ',' << initial_bg << ',' << initial_bl << ','
+                << r.bg_spent << ',' << r.bl_spent << ','
+                << r.final_bg << ',' << r.final_bl << ',' << r.steps << ','
+                << biscuit_score(initial) << ',' << biscuit_score(r.final_biscuit);
+
+            for (const auto& slot : initial)
+                out << ',' << slot.opt_idx << ',' << slot.val;
+            for (const auto& slot : r.final_biscuit)
+                out << ',' << slot.opt_idx << ',' << slot.val;
+            out << '\\n';
+        }
+    }
+    out.flush();
+    if (!out) {
+        std::cerr << "[Error] Q1 CSV 기록 실패: " << output_path << "\\n";
+        return 1;
+    }
+    std::cout << "[Q1] paired policies written: " << output_path << "\\n";
+    return 0;
+}
+
 struct MCTSConfig {
     Biscuit init_biscuit = { Slot{ 0, 3.0f }, Slot{ 1, 5.0f }, Slot{ 3, 3.0f }, Slot{ 4, 3.0f } };
     Goal goal = { { 3, 2, 3 },{ 4, 2, 3 } };
