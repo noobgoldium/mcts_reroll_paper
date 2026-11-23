@@ -27,7 +27,10 @@ jobs:
       - name: Run small simulation
         run: |
           mkdir -p out
-          ./mcts_engine --tier 0 --goal 0 --n_starts 2 --n_sim 100 --id_start 0 --id_end 2 --out out/smoke.csv
+          ./mcts_engine --tier 0 --goal 0 --n_starts 2 --n_sim 100 --id_start 0 --id_end 1 --seed 123456 --out out/smoke.csv
+          ./mcts_engine --tier 0 --goal 0 --n_starts 2 --n_sim 100 --id_start 0 --id_end 1 --seed 123456 --out out/smoke_repeat.csv
+          cmp out/smoke.csv out/smoke_repeat.csv
+          python3 -m py_compile q1_classifier.py q2_regression.py
 
       - name: Validate new CSV schema and terminal records
         run: |
@@ -43,7 +46,10 @@ jobs:
           required = {
               "q_stop", "q_continue", "biscuit_score", "matched_count",
               "goal_achieved", "bg_spent", "bl_spent", "decision_step",
-              "terminal_reason",
+              "terminal_reason", "rng_seed", "state_samples",
+              "state_progress_mean", "state_matched_mean", "state_bg_mean",
+              "state_bl_mean", "state_score_mean", "state_matched_min",
+              "state_matched_max",
           }
           assert required.issubset(rows[0].keys()), "missing STOP-analysis columns"
           assert all(int(row["best_action"]) in {-1, 0, 1, 2, 3, 4, 5} for row in rows)
