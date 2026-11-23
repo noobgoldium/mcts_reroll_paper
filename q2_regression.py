@@ -1,27 +1,27 @@
 """
-Q2: 잔여 빛도우 수에 따른 경험적 중단 품질 임계값과 Feynman 기준 비교.
+Q2: Open-loop MCTS의 STOP/CONTINUE edge-value gap과 Feynman 기준 비교.
 
-추정 대상:
-  stop_advantage = Q(STOP) - max_a Q(continue, a)
-  stop_advantage가 음수에서 양수로 바뀌는 biscuit_score / 200을 임계값으로 정의.
-
-주의:
-- Q값은 Open-loop MCTS 행동 이력 노드의 상태분포 평균이다.
-- state_score_mean을 변화시키는 것은 관측 상태에서의 조건부 partial-dependence 분석이다.
-  따라서 인과적 중단 경계라고 단정하지 않는다.
-- bootstrap CI는 biscuit episode 단위 cluster bootstrap이며, 학습된 모델을 고정한
-  조건부 표본 불확실성이다. 모델 재학습 불확실성까지 포함하지 않는다.
-- Feynman 기준은 구조적 비교값이지, 비스킷 리롤 문제의 이론적 최적해가 아니다.
+중요한 해석 제한:
+- q_stop은 STOP edge의 방문 평균, q_continue은 현재 대표 상태에서 합법적인
+  계속 행동 중 최고 Q edge의 방문 평균이다.
+- Open-loop 노드에서는 STOP edge와 특정 continue edge가 서로 다른 합법성
+  조건부 상태 표본을 가질 수 있다. 따라서 gap은 동일 상태의 반사실적 비교가
+  아니며, 인과적/이론적 최적 중단 경계가 아니라 기술적(action-value) 지표다.
+- ExtraTrees 예측은 계단형이다. 임계값은 부호가 처음 바뀌는 grid 구간의
+  상단 grid 점으로 정의하며, 선형 보간으로 가짜 정밀도를 만들지 않는다.
+- CI는 고정된 학습 모델을 조건으로 한 episode-cluster bootstrap이다.
+  모델 재학습 불확실성은 포함하지 않는다.
+- Feynman 식은 구조적 비교 기준이며 두 문제가 동등하다는 주장이 아니다.
 """
-
 import argparse
 import glob
 import os
+
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import ExtraTreesRegressor
-from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import GroupShuffleSplit
 
 SEED = 42
 FEATURES = [
@@ -32,51 +32,67 @@ FEATURES = [
     "state_matched_mean",
     "state_score_mean",
 ]
-TARGET = "stop_advantage"
+TARGET = "edge_value_gap"
 
 
 def feynman_threshold(n):
     """PNAS 논문의 균등분포 임계값 sqrt(n) / (sqrt(n) + 1)."""
     n = np.asarray(n, dtype=np.float64)
-    return np.sqrt(np.maximum(n, 0.0)) / (np.sqrt(np.maximum(n, 0.0)) + 1.0)
+    root = np.sqrt(np.maximum(n, 0.0))
+    return root / (root + 1.0)
 
 
-def load_data(csv_dir):
+def load_data(csv_dir, min_q_visits=20, min_state_samples=20):
     files = sorted(glob.glob(os.path.join(csv_dir, "biscuit_tier_*.csv")))
     if not files:
         raise FileNotFoundError(f"CSV 없음: {csv_dir}/biscuit_tier_*.csv")
     df = pd.concat([pd.read_csv(path) for path in files], ignore_index=True)
 
     required = FEATURES + [
-        "q_stop", "q_continue", "terminal_reason", "state_samples",
-        "state_matched_min", "resource_tier", "goal_id", "biscuit_id", "rng_seed",
+        "q_stop", "q_continue", "q_stop_visits", "q_continue_visits",
+        "q_continue_action", "terminal_reason", "state_samples",
+        "state_matched_min", "resource_tier", "goal_id", "biscuit_id",
+        "rng_seed", "decision_step",
     ]
     missing = sorted(set(required) - set(df.columns))
     if missing:
         raise ValueError(
-            f"Q2 필수 컬럼 누락: {missing}. 최신 Open-loop 엔진으로 데이터를 생성해야 합니다."
+            f"Q2 필수 컬럼 누락: {missing}. 새 엔진으로 데이터를 생성해야 합니다."
         )
 
-    df = df.dropna(subset=required).copy()
+    numeric = required
+    df = df.dropna(subset=numeric).copy()
+    finite_cols = FEATURES + [
+        "q_stop", "q_continue", "q_stop_visits", "q_continue_visits",
+        "state_samples",
+    ]
+    finite_mask = np.isfinite(df[finite_cols].to_numpy(dtype=np.float64)).all(axis=1)
+    df = df.loc[finite_mask].copy()
+
+    before = len(df)
     df = df[
         (df["terminal_reason"] == 0)
-        & (df["state_samples"] > 0)
+        & (df["state_samples"] >= min_state_samples)
+        & (df["q_stop_visits"] >= min_q_visits)
+        & (df["q_continue_visits"] >= min_q_visits)
         & (df["state_matched_min"] >= 2)
         & (df["state_bl_mean"] > 0)
         & (df["q_stop"] >= 0)
         & (df["q_continue"] >= 0)
     ].copy()
+    print(
+        f"방문 수 필터: {before:,}행 → {len(df):,}행 "
+        f"(state≥{min_state_samples}, STOP/CONTINUE edge≥{min_q_visits})"
+    )
 
     df[TARGET] = df["q_stop"] - df["q_continue"]
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=FEATURES + [TARGET])
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURES + [TARGET])
     df["group_id"] = (
         df["resource_tier"].astype(str) + ":"
         + df["goal_id"].astype(str) + ":"
         + df["biscuit_id"].astype(str) + ":"
         + df["rng_seed"].astype(str)
     )
-    # 같은 biscuit episode의 동일 상태가 중복 CSV로 들어오지 않도록 한다.
     df = df.drop_duplicates(
         subset=["resource_tier", "goal_id", "biscuit_id", "rng_seed", "decision_step"],
         keep="first",
@@ -85,22 +101,23 @@ def load_data(csv_dir):
 
 
 def estimate_threshold(model, row, feature_columns, grid):
-    """예측 stop advantage의 음→양 부호 전환점을 선형 보간한다."""
+    """
+    계단형 모델의 첫 음→양 전환 구간을 반환한다.
+    반환값: (상단 grid 점, 구간 하한, 구간 상한); 전환이 없으면 NaN 세 개.
+    """
     candidates = pd.DataFrame(
         [{**row, "state_score_mean": float(score)} for score in grid],
         columns=feature_columns,
     )
-    pred = model.predict(candidates)
+    pred = np.asarray(model.predict(candidates), dtype=np.float64)
     crossings = np.flatnonzero((pred[:-1] < 0.0) & (pred[1:] >= 0.0))
     if len(crossings) == 0:
-        return np.nan
-
+        return np.nan, np.nan, np.nan
     i = int(crossings[0])
-    x0, x1 = float(grid[i]), float(grid[i + 1])
-    y0, y1 = float(pred[i]), float(pred[i + 1])
-    if abs(y1 - y0) < 1e-12:
-        return x1
-    return float(np.clip(x0 + (0.0 - y0) * (x1 - x0) / (y1 - y0), x0, x1))
+    lower = float(grid[i])
+    upper = float(grid[i + 1])
+    # ExtraTrees의 piecewise-constant prediction에 선형 보간을 적용하지 않는다.
+    return upper, lower, upper
 
 
 def bootstrap_mean_ci(values, n_boot, rng):
@@ -122,17 +139,27 @@ def main():
     parser.add_argument("--csv-dir", default=".")
     parser.add_argument("--bootstrap", type=int, default=2000)
     parser.add_argument("--min-groups-per-bin", type=int, default=20)
+    parser.add_argument("--min-q-visits", type=int, default=20)
+    parser.add_argument("--min-state-samples", type=int, default=20)
     parser.add_argument("--output-prefix", default="q2")
     args = parser.parse_args()
 
-    if args.bootstrap < 0 or args.min_groups_per_bin < 2:
-        raise ValueError("--bootstrap은 0 이상, --min-groups-per-bin은 2 이상이어야 합니다.")
+    if args.bootstrap < 0:
+        raise ValueError("--bootstrap은 0 이상이어야 합니다.")
+    if args.min_groups_per_bin < 2:
+        raise ValueError("--min-groups-per-bin은 2 이상이어야 합니다.")
+    if args.min_q_visits < 1 or args.min_state_samples < 1:
+        raise ValueError("방문 수 최소 기준은 1 이상이어야 합니다.")
 
-    df = load_data(args.csv_dir)
+    df = load_data(
+        args.csv_dir,
+        min_q_visits=args.min_q_visits,
+        min_state_samples=args.min_state_samples,
+    )
     if df["group_id"].nunique() < 30 or len(df) < 100:
         raise RuntimeError(
             f"Q2 표본 부족: {len(df)}행, {df['group_id'].nunique()}개 episode. "
-            "최소 30개 episode와 100개 decision row가 필요합니다."
+            "필터 기준 또는 실험 표본을 점검해야 합니다."
         )
 
     X = df[FEATURES].astype(float).reset_index(drop=True)
@@ -154,28 +181,34 @@ def main():
     y_test = y.iloc[test_idx].to_numpy()
     print(f"유효 표본: {len(df):,}행 / {groups.nunique():,} episodes")
     print(f"train: {len(train_idx):,}행 / test: {len(test_idx):,}행")
-    print(f"Stop advantage R²: {r2_score(y_test, pred):.4f}")
+    print(f"Edge-value gap R²: {r2_score(y_test, pred):.4f}")
     print(f"MAE: {mean_absolute_error(y_test, pred):.5f}")
     print(f"RMSE: {mean_squared_error(y_test, pred) ** 0.5:.5f}")
 
     score_grid = np.linspace(0.0, 200.0, 401)
+    grid_step = float(score_grid[1] - score_grid[0])
     rows = []
     for i in test_idx:
         row = X.iloc[i].to_dict()
-        threshold_score = estimate_threshold(model, row, FEATURES, score_grid)
-        if np.isfinite(threshold_score):
+        threshold, lower, upper = estimate_threshold(model, row, FEATURES, score_grid)
+        if np.isfinite(threshold):
             n = float(row["state_bl_mean"])
             rows.append({
                 "group_id": groups.iloc[i],
                 "n_remaining": n,
                 "remaining_bin": int(round(n)),
-                "estimated_threshold": threshold_score / 200.0,
+                "estimated_threshold": threshold / 200.0,
+                "threshold_bracket_low": lower / 200.0,
+                "threshold_bracket_high": upper / 200.0,
                 "feynman_threshold": float(feynman_threshold(n)),
+                "q_stop_visits": int(df.iloc[i]["q_stop_visits"]),
+                "q_continue_visits": int(df.iloc[i]["q_continue_visits"]),
+                "q_continue_action": int(df.iloc[i]["q_continue_action"]),
             })
 
     if not rows:
         raise RuntimeError(
-            "검증 데이터에서 stop advantage의 음→양 부호 전환이 관측되지 않았습니다. "
+            "검증 데이터에서 stop/continue edge-value gap의 음→양 전환이 없습니다. "
             "임계값을 임의로 외삽하지 않고 분석을 중단합니다."
         )
 
@@ -183,11 +216,12 @@ def main():
     raw["difference"] = raw["estimated_threshold"] - raw["feynman_threshold"]
     raw.to_csv(f"{args.output_prefix}_threshold_estimates.csv", index=False)
 
-    # 여러 decision row가 같은 biscuit episode에서 나오므로 먼저 episode/bin 단위로 집계.
     episode_bin = raw.groupby(
         ["remaining_bin", "group_id"], as_index=False
     ).agg(
         estimated_threshold=("estimated_threshold", "mean"),
+        threshold_bracket_low=("threshold_bracket_low", "mean"),
+        threshold_bracket_high=("threshold_bracket_high", "mean"),
         feynman_threshold=("feynman_threshold", "mean"),
         difference=("difference", "mean"),
     )
@@ -212,6 +246,9 @@ def main():
             "estimated_threshold": est,
             "estimated_ci95_low": est_lo,
             "estimated_ci95_high": est_hi,
+            "threshold_bracket_low_mean": float(part["threshold_bracket_low"].mean()),
+            "threshold_bracket_high_mean": float(part["threshold_bracket_high"].mean()),
+            "threshold_grid_step": grid_step / 200.0,
             "feynman_threshold": fey,
             "feynman_ci95_low": fey_lo,
             "feynman_ci95_high": fey_hi,
@@ -230,7 +267,8 @@ def main():
 
     print(f"임계값 추정 행: {len(raw):,}")
     print(f"독립 episode/bin 표본: {len(episode_bin):,}")
-    print("\n잔여 빛도우 수별 임계값 및 episode-cluster bootstrap 95% CI:")
+    print(f"임계값 grid 해상도: {grid_step:.3f} score ({grid_step / 200.0:.5f} normalized)")
+    print("\n잔여 빛도우 수별 기술적 임계점 및 episode-cluster bootstrap 95% CI:")
     print(summary.to_string(index=False))
     print(f"\n저장: {args.output_prefix}_threshold_estimates.csv")
     print(f"저장: {args.output_prefix}_threshold_summary.csv")
