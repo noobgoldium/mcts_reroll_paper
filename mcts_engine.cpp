@@ -985,7 +985,9 @@ static void print_usage() {
         "  --out PATH          출력 CSV (--tier/--goal 둘 다 지정 시에만 사용)\n"
         "  --n_starts N        기본 100000\n"
         "  --n_sim N           기본 500\n"
-        "  --seed N            재현 가능한 64-bit seed\n";
+        "  --seed N            재현 가능한 64-bit seed\n"
+        "  --q1_compare        Q1-A/B paired fixed-policy experiment\n"
+        "  --q1_out PATH       Q1 비교 CSV 출력 경로\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -1021,6 +1023,8 @@ int main(int argc, char* argv[]) {
     int n_starts = 100000, n_sim = 500;
     uint64_t base_seed = 20261123ULL;
     std::string out_path;
+    std::string q1_out_path;
+    bool q1_compare = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -1041,6 +1045,8 @@ int main(int argc, char* argv[]) {
             else if (a == "--n_starts")       n_starts = std::stoi(need());
             else if (a == "--n_sim")          n_sim = std::stoi(need());
             else if (a == "--seed")            base_seed = std::stoull(need());
+            else if (a == "--q1_compare")       q1_compare = true;
+            else if (a == "--q1_out")           q1_out_path = need();
             else { std::cerr << "[Error] 알 수 없는 인자: " << a << "\n"; print_usage(); return 2; }
         } catch (const std::exception&) {
             std::cerr << "[Error] 잘못된 값: " << a << "\n";
@@ -1060,6 +1066,26 @@ int main(int argc, char* argv[]) {
     if (!out_path.empty() && (tier_filter < 0 || goal_filter < 0)) {
         std::cerr << "[Error] --out은 --tier와 --goal을 함께 지정해야 합니다.\n";
         return 2;
+    }
+
+    if (q1_compare) {
+        if (tier_filter < 0 || goal_filter < 0 || q1_out_path.empty()) {
+            std::cerr << "[Error] --q1_compare에는 --tier, --goal, --q1_out이 필요합니다.\\n";
+            return 2;
+        }
+        if (!out_path.empty()) {
+            std::cerr << "[Error] Q1 비교 모드에서는 --out 대신 --q1_out을 사용하세요.\\n";
+            return 2;
+        }
+        auto parent = std::filesystem::path(q1_out_path).parent_path();
+        if (!parent.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(parent, ec);
+        }
+        const auto& tier = TIERS[static_cast<size_t>(tier_filter)];
+        return run_q1_compare(
+            GOALS[static_cast<size_t>(goal_filter)], goal_filter, tier_filter,
+            tier.bg, tier.bl, id_start, id_end, base_seed, q1_out_path);
     }
 
     std::cout << "[Info] threads=" << std::max(1u, std::thread::hardware_concurrency())
