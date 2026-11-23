@@ -38,6 +38,8 @@ jobs:
           cmp out/smoke.csv out/smoke_repeat.csv
           .venv/bin/python -m py_compile q1_classifier.py q1_policy_analysis.py q2_regression.py
           ./mcts_engine --tier 0 --goal 0 --n_starts 30 --id_start 0 --id_end 30 --seed 123456 --q1_compare --q1_out out/q1_smoke.csv
+          ./mcts_engine --tier 0 --goal 0 --n_starts 30 --id_start 0 --id_end 30 --seed 123456 --q1_compare --q1_out out/q1_smoke_repeat.csv
+          cmp out/q1_smoke.csv out/q1_smoke_repeat.csv
           python3 - <<'PY'
           import csv
           from collections import defaultdict
