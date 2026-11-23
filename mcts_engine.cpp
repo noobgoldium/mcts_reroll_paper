@@ -749,6 +749,7 @@ int run_q1_compare(
     };
     const auto initials = generate_inits(
         base, id_start, id_end, has_attribute_damage, base_seed);
+    const int total = id_end - id_start;
 
     std::ofstream out(output_path, std::ios::trunc);
     if (!out) {
@@ -763,8 +764,43 @@ int run_q1_compare(
            "initial_opt3,initial_val3,final_opt0,final_val0,final_opt1,final_val1,"
            "final_opt2,final_val2,final_opt3,final_val3\n";
 
-    for (int local = 0; local < id_end - id_start; ++local) {
-        if (g_stop.load(std::memory_order_relaxed)) return EXIT_INTERRUPTED;
+    // Each worker owns its thread-local RNG. Results are stored by local ID and
+    // serialized in ID order after joining, so output is deterministic.
+    std::vector<std::array<Q1PolicyResult, 2>> results(static_cast<size_t>(total));
+    std::vector<uint8_t> completed(static_cast<size_t>(total), 0);
+    std::atomic<int> next_local{ 0 };
+    const int worker_count = std::min(
+        total, static_cast<int>(std::max(1u, std::thread::hardware_concurrency())));
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(worker_count));
+
+    for (int worker = 0; worker < worker_count; ++worker) {
+        workers.emplace_back([&]() {
+            while (!g_stop.load(std::memory_order_relaxed)) {
+                const int local = next_local.fetch_add(1, std::memory_order_relaxed);
+                if (local >= total) break;
+
+                const int id = id_start + local;
+                const Biscuit& initial = initials[static_cast<size_t>(local)];
+                const uint64_t seed_a = mix_seed(
+                    base_seed ^ static_cast<uint64_t>(id) ^ 0x513141ULL);
+                const uint64_t seed_b = mix_seed(
+                    base_seed ^ static_cast<uint64_t>(id) ^ 0x513142ULL);
+
+                results[static_cast<size_t>(local)][0] = simulate_q1_policy(
+                    initial, goal, initial_bg, initial_bl,
+                    has_attribute_damage, 1, seed_a);
+                results[static_cast<size_t>(local)][1] = simulate_q1_policy(
+                    initial, goal, initial_bg, initial_bl,
+                    has_attribute_damage, 2, seed_b);
+                completed[static_cast<size_t>(local)] = 1;
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+
+    for (int local = 0; local < total; ++local) {
+        if (!completed[static_cast<size_t>(local)]) continue;
         const int id = id_start + local;
         const Biscuit& initial = initials[static_cast<size_t>(local)];
         const int initial_matched =
@@ -772,14 +808,10 @@ int run_q1_compare(
         const uint64_t init_seed = mix_seed(
             base_seed ^ static_cast<uint64_t>(id) ^ 0x494E495449414CULL);
 
-        for (int threshold : { 1, 2 }) {
-            const uint64_t policy_seed = mix_seed(
-                base_seed ^ static_cast<uint64_t>(id) ^
-                (threshold == 1 ? 0x513141ULL : 0x513142ULL));
-            const auto r = simulate_q1_policy(
-                initial, goal, initial_bg, initial_bl,
-                has_attribute_damage, threshold, policy_seed);
-
+        for (int policy_index = 0; policy_index < 2; ++policy_index) {
+            const int threshold = policy_index + 1;
+            const auto& r = results[static_cast<size_t>(local)]
+                                    [static_cast<size_t>(policy_index)];
             out << goal_id << ',' << resource_tier << ',' << id << ','
                 << init_seed << ',' << (threshold == 1 ? "Q1-A" : "Q1-B") << ','
                 << initial_matched << ',' << threshold << ','
@@ -802,7 +834,12 @@ int run_q1_compare(
         std::cerr << "[Error] Q1 CSV 기록 실패: " << output_path << "\n";
         return 1;
     }
-    std::cout << "[Q1] paired policies written: " << output_path << "\n";
+    if (g_stop.load(std::memory_order_relaxed)) {
+        std::cout << "[Q1] interrupted; completed paired rows were flushed.\n";
+        return EXIT_INTERRUPTED;
+    }
+    std::cout << "[Q1] paired policies written: " << output_path
+              << " (workers=" << worker_count << ")\n";
     return 0;
 }
 
