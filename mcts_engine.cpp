@@ -335,9 +335,11 @@ struct MCTSTree {
                     legal[legal_count++] = a;
             if (legal_count == 0) break;
 
-            // 일반도우는 매칭 슬롯이 0개일 때만 legal 목록에 들어간다.
-            // 따라서 매칭 이후에는 반드시 미매칭 슬롯의 빛도우 중에서 고른다.
-            const int a = legal[tl_rng.next_int(legal_count)];
+            // Rollout 정책은 합법 행동과 STOP을 균등 추출한다.
+            // STOP을 뽑으면 현재 상태를 terminal outcome으로 평가한다.
+            const int choice = tl_rng.next_int(legal_count + 1);
+            if (choice == legal_count) break;
+            const int a = legal[choice];
             if (a == ACTION_GENERAL) {
                 b = reroll_general(b);
                 --bg;
@@ -398,7 +400,7 @@ struct MCTSTree {
             }
             int best_a = -1; float best_q = -1e9f;
             float q_gen = 0.0f, q_light_sum = 0.0f; int q_light_cnt = 0;
-            float q_stop = 0.0f, q_continue = -1e9f;
+            float q_stop = -1.0f, q_continue = -1e9f;
             for (int a = 0; a < N_ACTIONS; ++a) {
                 int ci = node.children[a];
                 if (ci < 0) continue;
@@ -424,7 +426,7 @@ struct MCTSTree {
             rec.q_light_avg = q_light_cnt > 0 ?
                 q_light_sum / static_cast<float>(q_light_cnt) : 0.0f;
             rec.q_stop = q_stop;
-            rec.q_continue = q_continue > -1e8f ? q_continue : 0.0f;
+            rec.q_continue = q_continue > -1e8f ? q_continue : -1.0f;
             rec.score = biscuit_score(node.biscuit);
             rec.matched_count = count_matched_slots(get_matched_slots(node.biscuit, goal));
             rec.goal_achieved = check_goal(node.biscuit, goal) ? 1 : 0;
