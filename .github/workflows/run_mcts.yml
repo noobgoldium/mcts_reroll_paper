@@ -21,6 +21,10 @@ on:
         description: "chunk 당 biscuit 수 (chunk c = id [c*size, (c+1)*size))"
         required: true
         default: "10000"
+      seed:
+        description: "재현 가능한 실험 seed (모든 matrix job에 공통 적용)"
+        required: true
+        default: "20261123"
 
 permissions:
   contents: read
@@ -38,6 +42,7 @@ jobs:
           GOALS: ${{ inputs.goals }}
           CHUNKS: ${{ inputs.chunks }}
           CHUNK_SIZE: ${{ inputs.chunk_size }}
+          SEED: ${{ inputs.seed }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -45,6 +50,8 @@ jobs:
 
           tier = int(os.environ["TIER"])
           chunk_size = int(os.environ["CHUNK_SIZE"])
+          seed = int(os.environ["SEED"])
+          assert 0 <= seed <= 18446744073709551615, "seed must fit uint64"
           goals = [int(x.strip()) for x in os.environ["GOALS"].split(",") if x.strip()]
           chunks = [int(x.strip()) for x in os.environ["CHUNKS"].split(",") if x.strip()]
 
@@ -76,6 +83,7 @@ jobs:
       GOAL: ${{ matrix.goal }}
       CHUNK: ${{ matrix.chunk }}
       CHUNK_SIZE: ${{ inputs.chunk_size }}
+      SEED: ${{ inputs.seed }}
       ARTIFACT_NAME: mcts-matrix-t${{ inputs.tier }}-g${{ matrix.goal }}-c${{ matrix.chunk }}
     steps:
       - name: Checkout repository
@@ -102,6 +110,7 @@ jobs:
           timeout --signal=TERM --kill-after=5m 120m ./mcts_engine \
             --tier "$TIER" --goal "$GOAL" \
             --id_start "$ID_START" --id_end "$ID_END" \
+            --seed "$SEED" \
             --out "out/biscuit_tier_${TIER}_goal_${GOAL}_chunk_${CHUNK}.csv"
           rc=$?
           set -e
