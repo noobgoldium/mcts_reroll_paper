@@ -99,7 +99,7 @@ jobs:
           # TERM을 보내 엔진이 현재 biscuit 처리를 마친 뒤 종료할 기회를 준다.
           # 시간 초과 시 job은 실패로 표시되며, 산출물은 진단용으로 업로드한다.
           set +e
-          timeout --signal=TERM --kill-after=5m 345m ./mcts_engine \
+          timeout --signal=TERM --kill-after=5m 120m ./mcts_engine \
             --tier "$TIER" --goal "$GOAL" \
             --id_start "$ID_START" --id_end "$ID_END" \
             --out "out/biscuit_tier_${TIER}_goal_${GOAL}_chunk_${CHUNK}.csv"
