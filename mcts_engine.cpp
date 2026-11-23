@@ -415,6 +415,7 @@ struct MCTSTree {
             int q_light_count = 0;
 
             for (int a = 0; a < N_ACTIONS; ++a) {
+                if (!is_action_legal(b, bg, bl, goal, a)) continue;
                 const int ci = node.children[a];
                 if (ci < 0 || nodes[ci].visits == 0) continue;
                 const float q = nodes[ci].value / static_cast<float>(nodes[ci].visits);
