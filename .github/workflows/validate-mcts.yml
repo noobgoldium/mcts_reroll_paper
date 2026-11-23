@@ -73,6 +73,7 @@ jobs:
           fields = [
               "resource_tier","goal_id","state_bl_mean","state_progress_mean",
               "state_matched_mean","state_score_mean","q_stop","q_continue",
+              "q_stop_visits","q_continue_visits","q_continue_action",
               "terminal_reason","state_samples","state_matched_min","biscuit_id","rng_seed","decision_step"
           ]
           with open("out/q2_synthetic/biscuit_tier_0_goal_0.csv","w",newline="") as f:
@@ -88,11 +89,32 @@ jobs:
                           "state_score_mean":score,"q_stop":stop,"q_continue":cont,
                           "terminal_reason":0,"state_samples":100,
                           "state_matched_min":2,"biscuit_id":biscuit,"rng_seed":123456 + biscuit,
+                          "q_stop_visits":100,"q_continue_visits":100,"q_continue_action":1,
                           "decision_step":step
                       })
           PY
-          .venv/bin/python q2_regression.py --csv-dir out/q2_synthetic --bootstrap 100 --min-groups-per-bin 2 --output-prefix out/q2_smoke
+          .venv/bin/python q2_regression.py --csv-dir out/q2_synthetic --bootstrap 100 --min-groups-per-bin 2 --min-q-visits 20 --min-state-samples 20 --output-prefix out/q2_smoke
           test -s out/q2_smoke_threshold_summary.csv
+          .venv/bin/python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          from q2_regression import estimate_threshold, FEATURES
+
+          class StepModel:
+              def predict(self, frame):
+                  return np.where(frame["state_score_mean"].to_numpy() < 80.25, -0.1, 0.1)
+
+          grid = np.linspace(0.0, 200.0, 401)
+          point, lower, upper = estimate_threshold(
+              StepModel(),
+              {"resource_tier": 0, "goal_id": 0, "state_bl_mean": 5,
+               "state_progress_mean": 0.5, "state_matched_mean": 2.5,
+               "state_score_mean": 0.0},
+              FEATURES, grid
+          )
+          assert point == 80.5 and lower == 80.0 and upper == 80.5, (point, lower, upper)
+          print("validated step-function threshold bracket without interpolation")
+          PY
 
       - name: Validate new CSV schema and terminal records
         run: |
