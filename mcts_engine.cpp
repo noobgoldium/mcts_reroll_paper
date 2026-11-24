@@ -251,6 +251,16 @@ struct Record {
     int state_matched_min = -1, state_matched_max = -1;
     double state_progress_mean = 0.0, state_matched_mean = 0.0;
     double state_bg_mean = 0.0, state_bl_mean = 0.0, state_score_mean = 0.0;
+
+    // Per-slot state and first-match event on the extracted representative path.
+    std::array<int, 4> slot_opt_idx{};
+    std::array<float, 4> slot_value{};
+    std::array<int, 4> slot_tier{};
+    std::array<int, 4> slot_matched{};
+    std::array<int, 4> slot_match_event{};
+    std::array<int, 4> slot_match_x{};
+    std::array<int, 4> slot_match_step{};
+    std::array<float, 4> slot_match_score{};
 };
 
 struct MCTSTree {
@@ -441,13 +451,24 @@ struct MCTSTree {
         rec.bl_spent = initial_bl - bl;
         rec.decision_step = depth;
         rec.terminal_reason = terminal_reason;
-        for (const auto& slot : b) {
+        for (size_t i = 0; i < b.size(); ++i) {
+            const auto& slot = b[i];
             const int tier = get_tier(slot.opt_idx, slot.val);
             if (tier >= 1 && tier <= 5)
                 rec.tier_counts[static_cast<size_t>(tier - 1)]++;
             int& mx = rec.opt_max_tier[static_cast<size_t>(slot.opt_idx)];
             if (tier > mx) mx = tier;
+
+            rec.slot_opt_idx[i] = slot.opt_idx;
+            rec.slot_value[i] = slot.val;
+            rec.slot_tier[i] = tier;
+            rec.slot_match_x[i] = -1;
+            rec.slot_match_step[i] = -1;
+            rec.slot_match_score[i] = -1.0f;
         }
+        const auto matched_slots = get_matched_slots(b, goal);
+        for (size_t i = 0; i < matched_slots.size(); ++i)
+            rec.slot_matched[i] = matched_slots[i] ? 1 : 0;
     }
 
     std::vector<Record> extract_records(int max_depth = 200) {
@@ -456,10 +477,28 @@ struct MCTSTree {
         int bg = initial_bg, bl = initial_bl;
         int idx = 0;
         int switch_matched = -1, switch_bl_remaining = -1;
+        auto previous_matched = get_matched_slots(b, goal);
 
         for (int depth = 0; depth < max_depth; ++depth) {
             Record rec;
             fill_state_record(rec, b, bg, bl, depth, 0);
+
+            // A slot becomes "stopped" when it first satisfies its goal entry:
+            // matched slots are thereafter illegal light-reroll targets.
+            // This is a deterministic slot lock, not ACTION_STOP (which stops
+            // the entire biscuit). x is measured from the first light reroll.
+            const auto current_matched = get_matched_slots(b, goal);
+            for (size_t slot = 0; slot < current_matched.size(); ++slot) {
+                if (current_matched[slot] && !previous_matched[slot]) {
+                    rec.slot_match_event[slot] = 1;
+                    rec.slot_match_step[slot] = depth;
+                    rec.slot_match_score[slot] =
+                        slot_contribution(b[slot].opt_idx, b[slot].val);
+                    if (switch_bl_remaining >= 0)
+                        rec.slot_match_x[slot] = switch_bl_remaining - bl;
+                }
+            }
+            previous_matched = current_matched;
 
             const Node& node = nodes[idx];
             fill_state_stats(rec, node);
@@ -610,7 +649,11 @@ static const std::string CSV_HEADER =
 "q_stop,q_continue,biscuit_score,matched_count,goal_achieved,"
 "bg_spent,bl_spent,decision_step,terminal_reason,rng_seed,"
 "state_samples,state_progress_mean,state_matched_mean,state_bg_mean,state_bl_mean,state_score_mean,"
-"state_matched_min,state_matched_max,q_stop_visits,q_continue_visits,q_continue_action\n";
+"state_matched_min,state_matched_max,q_stop_visits,q_continue_visits,q_continue_action,"
+"slot0_opt_idx,slot0_value,slot0_tier,slot0_matched,slot0_match_event,slot0_match_x,slot0_match_step,slot0_match_score,"
+"slot1_opt_idx,slot1_value,slot1_tier,slot1_matched,slot1_match_event,slot1_match_x,slot1_match_step,slot1_match_score,"
+"slot2_opt_idx,slot2_value,slot2_tier,slot2_matched,slot2_match_event,slot2_match_x,slot2_match_step,slot2_match_score,"
+"slot3_opt_idx,slot3_value,slot3_tier,slot3_matched,slot3_match_event,slot3_match_x,slot3_match_step,slot3_match_score\n";
 
 static constexpr int EXIT_INTERRUPTED = 75;       // SIGINT/SIGTERM 안전 종료
 
@@ -922,7 +965,18 @@ int run_mcts_pipeline(const MCTSConfig& cfg)
                   << "," << r.state_bg_mean << "," << r.state_bl_mean
                   << "," << r.state_score_mean << "," << r.state_matched_min
                   << "," << r.state_matched_max << "," << r.q_stop_visits
-                  << "," << r.q_continue_visits << "," << r.q_continue_action << "\n";
+                  << "," << r.q_continue_visits << "," << r.q_continue_action;
+                for (size_t slot = 0; slot < 4; ++slot) {
+                    f << "," << r.slot_opt_idx[slot]
+                      << "," << r.slot_value[slot]
+                      << "," << r.slot_tier[slot]
+                      << "," << r.slot_matched[slot]
+                      << "," << r.slot_match_event[slot]
+                      << "," << r.slot_match_x[slot]
+                      << "," << r.slot_match_step[slot]
+                      << "," << r.slot_match_score[slot];
+                }
+                f << "\n";
             }
             f.flush();
         };
