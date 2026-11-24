@@ -30,11 +30,12 @@ def main() -> None:
         parser.error("--chunk-size must be positive")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    all_rows: list[dict[str, str]] = []
+    expected_header: list[str] | None = None
     total_rows = 0
 
     for goal in args.goals:
         merged_rows: list[dict[str, str]] = []
-        expected_header: list[str] | None = None
         seen_keys: set[tuple[str, ...]] = set()
 
         for chunk in args.chunks:
@@ -98,19 +99,25 @@ def main() -> None:
                 if chunk_biscuit_ids != expected_ids:
                     raise SystemExit(f"Unexpected biscuit ID coverage in {path}")
 
-        output = args.output_dir / f"biscuit_tier_{args.tier}_goal_{goal}.csv"
-        with output.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=expected_header)
-            writer.writeheader()
-            writer.writerows(merged_rows)
-
+        all_rows.extend(merged_rows)
         total_rows += len(merged_rows)
         print(
-            f"Merged tier={args.tier}, goal={goal}: "
-            f"{len(args.chunks)} chunks, {len(merged_rows)} rows -> {output}"
+            f"Validated tier={args.tier}, goal={goal}: "
+            f"{len(args.chunks)} chunks, {len(merged_rows)} rows"
         )
 
-    print(f"Validation and merge complete: {len(args.goals)} files, {total_rows} rows")
+    output = args.output_dir / f"biscuit_tier_{args.tier}_merged.csv"
+    if expected_header is None:
+        raise SystemExit("No CSV schema was loaded")
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=expected_header)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(
+        f"Validation and merge complete: {len(args.chunks) * len(args.goals)} chunks, "
+        f"{total_rows} rows -> {output}"
+    )
 
 
 if __name__ == "__main__":
