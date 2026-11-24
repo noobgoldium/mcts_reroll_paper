@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/mcts-constraints-and-records
+      - feat/slot-match-events
   pull_request:
     branches:
       - main
