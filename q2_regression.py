@@ -141,6 +141,7 @@ def load_slot_events(csv_dir):
                 "match_action": action,
                 "x_light_spent": x,
                 "n_light_remaining": switch_remaining - x,
+                "feynman_reference": float(feynman_threshold(switch_remaining - x)),
                 "match_step": int(row[f"slot{slot}_match_step"]),
                 "decision_step": int(row["decision_step"]),
                 "opt_idx": opt_idx,
@@ -151,6 +152,9 @@ def load_slot_events(csv_dir):
                 "slot_score_ratio": float(np.clip(normalized_score, 0.0, 1.0)),
                 "source_row": int(row_index),
             })
+            event["difference"] = (
+                event["slot_score_ratio"] - event["feynman_reference"]
+            )
             event_rows.append(event)
 
     if invalid_light_events:
@@ -199,13 +203,9 @@ def summarize_curve(events, group_columns, min_episodes, n_boot, seed):
     per_episode = events.groupby(episode_columns, as_index=False).agg(
         slot_score_ratio=("slot_score_ratio", "mean"),
         n_light_remaining=("n_light_remaining", "mean"),
+        feynman_reference=("feynman_reference", "mean"),
+        difference=("difference", "mean"),
         event_count=("slot_score_ratio", "size"),
-    )
-    per_episode["feynman_reference"] = feynman_threshold(
-        per_episode["n_light_remaining"].to_numpy()
-    )
-    per_episode["difference"] = (
-        per_episode["slot_score_ratio"] - per_episode["feynman_reference"]
     )
 
     rng = np.random.default_rng(seed)
