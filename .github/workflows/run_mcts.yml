@@ -147,3 +147,37 @@ jobs:
           path: out/*.csv
           retention-days: 90
           if-no-files-found: ignore
+
+  merge-mcts-csv:
+    name: Merge and validate MCTS CSV chunks
+    if: ${{ inputs.experiment == 'mcts' }}
+    needs: mcts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all MCTS chunk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mcts-t${{ inputs.tier }}-g*-c*
+          path: chunks
+          merge-multiple: true
+
+      - name: Validate and merge CSV chunks
+        run: |
+          python3 merge_mcts_chunks.py \
+            --input-dir chunks \
+            --output-dir merged \
+            --tier "${{ inputs.tier }}" \
+            --goals "${{ inputs.goals }}" \
+            --chunks "${{ inputs.chunks }}" \
+            --chunk-size "${{ inputs.chunk_size }}"
+
+      - name: Upload merged CSVs
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcts-merged-t${{ inputs.tier }}
+          path: merged/biscuit_tier_*.csv
+          retention-days: 90
+          if-no-files-found: error
