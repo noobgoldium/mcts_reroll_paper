@@ -485,8 +485,8 @@ struct MCTSTree {
             Record rec;
             fill_state_record(rec, b, bg, bl, depth, 0);
 
-            // A slot becomes "stopped" when it first satisfies its goal entry:
-            // matched slots are thereafter illegal light-reroll targets.
+            // A slot is locked while it satisfies its goal entry; record each
+            // unmatched-to-matched transition and the action that produced it.
             // This is a deterministic slot lock, not ACTION_STOP (which stops
             // the entire biscuit). x is measured from the first light reroll.
             const auto current_matched = get_matched_slots(b, goal);
