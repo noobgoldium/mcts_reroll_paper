@@ -513,7 +513,6 @@ struct MCTSTree {
             idx = node.children[best_action];
             if (idx < 0) break;
 
-            const auto matched = get_matched_slots(b, goal);
             bool has_legal_continue =
                 is_action_legal(b, bg, bl, goal, ACTION_GENERAL);
             for (int a = ACTION_LIGHT_FIRST; a <= ACTION_LIGHT_LAST; ++a)
