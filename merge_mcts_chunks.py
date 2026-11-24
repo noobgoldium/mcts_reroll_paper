@@ -60,6 +60,7 @@ def main() -> None:
                     raise SystemExit(f"CSV schema mismatch in {path}")
 
                 chunk_rows = 0
+                chunk_biscuit_ids: set[int] = set()
                 for row in reader:
                     try:
                         row_tier = int(row["resource_tier"])
@@ -83,10 +84,19 @@ def main() -> None:
                         raise SystemExit(f"Duplicate decision key {key} in goal {goal}")
                     seen_keys.add(key)
                     merged_rows.append(row)
+                    chunk_biscuit_ids.add(biscuit_id)
                     chunk_rows += 1
 
-                if chunk_rows == 0:
-                    raise SystemExit(f"Chunk CSV contains no data rows: {path}")
+                expected_ids = set(range(start_id, end_id))
+                missing_ids = expected_ids - chunk_biscuit_ids
+                if missing_ids:
+                    preview = sorted(missing_ids)[:10]
+                    raise SystemExit(
+                        f"Chunk {chunk} is incomplete: {len(missing_ids)} biscuit IDs "
+                        f"have no CSV rows; first missing IDs: {preview}"
+                    )
+                if chunk_biscuit_ids != expected_ids:
+                    raise SystemExit(f"Unexpected biscuit ID coverage in {path}")
 
         output = args.output_dir / f"biscuit_tier_{args.tier}_goal_{goal}.csv"
         with output.open("w", newline="", encoding="utf-8") as handle:
