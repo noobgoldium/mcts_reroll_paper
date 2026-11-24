@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/mcts-constraints-and-records
+      - feat/slot-match-events
   pull_request:
     branches:
       - main
@@ -99,56 +100,82 @@ jobs:
           test -s out/q1_analysis.csv
           mkdir -p out/q2_synthetic
           python3 - <<'PY'
-          import csv, math, random
-          random.seed(7)
-          fields = [
-              "resource_tier","goal_id","state_bl_mean","state_progress_mean",
-              "state_matched_mean","state_score_mean","q_stop","q_continue",
-              "q_stop_visits","q_continue_visits","q_continue_action",
-              "terminal_reason","state_samples","state_matched_min","biscuit_id","rng_seed","decision_step"
-          ]
-          with open("out/q2_synthetic/biscuit_tier_0_goal_0.csv","w",newline="") as f:
-              w = csv.DictWriter(f,fieldnames=fields); w.writeheader()
+          import csv
+          from pathlib import Path
+
+          fields = ["resource_tier", "goal_id", "biscuit_id", "rng_seed",
+                    "bl_remaining_at_switch", "decision_step"]
+          for slot in range(4):
+              fields += [f"slot{slot}_{name}" for name in (
+                  "opt_idx", "value", "tier", "matched", "match_event",
+                  "match_action", "match_x", "match_step", "match_score")]
+          path = Path("out/q2_synthetic/biscuit_tier_0_goal_0.csv")
+          with path.open("w", newline="", encoding="utf-8") as handle:
+              writer = csv.DictWriter(handle, fieldnames=fields)
+              writer.writeheader()
               for biscuit in range(80):
-                  n = 2 + biscuit % 8
-                  for step, score in enumerate((20,60,100,140)):
-                      stop = 0.4
-                      cont = max(0.01, 0.6 - score / 400.0)
-                      w.writerow({
-                          "resource_tier":0,"goal_id":0,"state_bl_mean":n,
-                          "state_progress_mean":0.5,"state_matched_mean":2.5,
-                          "state_score_mean":score,"q_stop":stop,"q_continue":cont,
-                          "terminal_reason":0,"state_samples":100,
-                          "state_matched_min":2,"biscuit_id":biscuit,"rng_seed":123456 + biscuit,
-                          "q_stop_visits":(1 if biscuit == 0 and step == 0 else 100),
-                          "q_continue_visits":100,"q_continue_action":1,
-                          "decision_step":step
-                      })
+                  for event_index, x in enumerate((1, 2, 3, 4)):
+                      slot = event_index
+                      ratio = 0.25 + 0.1 * event_index
+                      row = {
+                          "resource_tier": 0, "goal_id": 0, "biscuit_id": biscuit,
+                          "rng_seed": 123456 + biscuit, "bl_remaining_at_switch": 10,
+                          "decision_step": x,
+                      }
+                      for pos in range(4):
+                          row.update({
+                              f"slot{pos}_opt_idx": 0,
+                              f"slot{pos}_value": 3.0 + ratio * 4.5 if pos == slot else 3.0,
+                              f"slot{pos}_tier": 2 if pos == slot else 1,
+                              f"slot{pos}_matched": 1 if pos == slot else 0,
+                              f"slot{pos}_match_event": 1 if pos == slot else 0,
+                              f"slot{pos}_match_action": pos + 1 if pos == slot else -1,
+                              f"slot{pos}_match_x": x if pos == slot else -1,
+                              f"slot{pos}_match_step": x if pos == slot else -1,
+                              f"slot{pos}_match_score": ratio * 10.0 if pos == slot else -1.0,
+                          })
+                      writer.writerow(row)
+              # One general-dough match is deliberately present and must be excluded.
+              general = {key: 0 for key in fields}
+              general.update({
+                  "resource_tier": 0, "goal_id": 0, "biscuit_id": 0,
+                  "rng_seed": 123456, "bl_remaining_at_switch": -1,
+                  "decision_step": 0,
+              })
+              for pos in range(4):
+                  general.update({
+                      f"slot{pos}_opt_idx": 0, f"slot{pos}_value": 3.0,
+                      f"slot{pos}_tier": 1, f"slot{pos}_matched": 1 if pos == 0 else 0,
+                      f"slot{pos}_match_event": 1 if pos == 0 else 0,
+                      f"slot{pos}_match_action": 0 if pos == 0 else -1,
+                      f"slot{pos}_match_x": -1, f"slot{pos}_match_step": 0,
+                      f"slot{pos}_match_score": 0.0 if pos == 0 else -1.0,
+                  })
+              writer.writerow(general)
           PY
-          .venv/bin/python q2_regression.py --csv-dir out/q2_synthetic --bootstrap 100 --min-groups-per-bin 2 --min-q-visits 20 --min-state-samples 20 --output-prefix out/q2_smoke
-          test -s out/q2_smoke_threshold_summary.csv
+          .venv/bin/python q2_regression.py --csv-dir out/q2_synthetic --bootstrap 100 --min-episodes-per-point 2 --output-prefix out/q2_smoke
+          test -s out/q2_smoke_slot_events.csv
+          test -s out/q2_smoke_curve_by_spent.csv
+          test -s out/q2_smoke_curve_by_spent_and_slot.csv
+          test -s out/q2_smoke_curve_by_remaining.csv
+          test -s out/q2_smoke_curve_by_remaining_and_slot.csv
           .venv/bin/python - <<'PY'
-          import numpy as np
-          import pandas as pd
-          from q2_regression import estimate_threshold, load_data, FEATURES
+          from q2_regression import load_slot_events, summarize_curve
 
-          filtered = load_data("out/q2_synthetic", min_q_visits=20, min_state_samples=20)
-          assert len(filtered) == 319, f"low-visit row was not filtered: {len(filtered)} rows"
-
-          class StepModel:
-              def predict(self, frame):
-                  return np.where(frame["state_score_mean"].to_numpy() < 80.25, -0.1, 0.1)
-
-          grid = np.linspace(0.0, 200.0, 401)
-          point, lower, upper = estimate_threshold(
-              StepModel(),
-              {"resource_tier": 0, "goal_id": 0, "state_bl_mean": 5,
-               "state_progress_mean": 0.5, "state_matched_mean": 2.5,
-               "state_score_mean": 0.0},
-              FEATURES, grid
+          events = load_slot_events("out/q2_synthetic")
+          assert len(events) == 320, f"expected 320 light events, got {len(events)}"
+          assert set(events["match_action"]) == {1, 2, 3, 4}
+          assert all(events["match_action"] == events["slot"] + 1)
+          assert set(events["x_light_spent"]) == {1, 2, 3, 4}
+          assert set(events["n_light_remaining"]) == {6, 7, 8, 9}
+          summary = summarize_curve(
+              events, ["resource_tier", "goal_id", "x_light_spent"],
+              min_episodes=2, n_boot=100, seed=42
           )
-          assert point == 80.5 and lower == 80.0 and upper == 80.5, (point, lower, upper)
-          print("validated step-function threshold bracket without interpolation")
+          assert len(summary) == 4
+          assert summary["episodes"].eq(80).all()
+          assert summary["meets_min_episodes"].all()
+          print("validated 320 light-only slot events, x/n mapping, and episode bootstrap")
           PY
 
       - name: Validate new CSV schema and terminal records
