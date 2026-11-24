@@ -1,0 +1,127 @@
+name: Q2 Threshold Analysis
+
+# artifact 이름 패턴: mcts-tT-gG-cC (run_mcts.yml의 mcts experiment 결과)
+# 모든 청크를 모아 q2_regression.py를 실행하고 결과를 artifact로 저장한다.
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "분석할 자원 티어 (0~4)"
+        required: true
+        default: "4"
+      goals:
+        description: "분석할 goal id (쉼표 구분, 비워두면 전체)"
+        required: false
+        default: "0,1,2,3,4,5,6,7,8,9"
+      bootstrap:
+        description: "bootstrap 반복 횟수"
+        required: true
+        default: "2000"
+      min_q_visits:
+        description: "STOP/CONTINUE edge 최소 방문 수"
+        required: true
+        default: "20"
+      min_state_samples:
+        description: "노드 최소 state 표본 수"
+        required: true
+        default: "20"
+      min_groups_per_bin:
+        description: "BL bin당 최소 episode 수"
+        required: true
+        default: "20"
+
+permissions:
+  contents: read
+  actions: read    # artifact 조회·다운로드
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TIER: ${{ inputs.tier }}
+      GOALS: ${{ inputs.goals }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install numpy pandas scikit-learn
+
+      - name: Download MCTS CSV artifacts
+        run: |
+          mkdir -p csv_in
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          tier = os.environ["TIER"]
+          goals_raw = os.environ.get("GOALS", "").strip()
+          goals = [int(g.strip()) for g in goals_raw.split(",") if g.strip()] if goals_raw else list(range(10))
+          prefix = f"mcts-t{tier}-"
+
+          result = subprocess.run(
+              ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/artifacts?per_page=100"],
+              capture_output=True, text=True, check=True
+          )
+          arts = json.loads(result.stdout)["artifacts"]
+
+          # 만료 안 된 것 중 tier/goal 필터, 같은 이름이면 최신본
+          best = {}
+          for a in arts:
+              name = a["name"]
+              if a["expired"]:
+                  continue
+              if not name.startswith(prefix):
+                  continue
+              # mcts-tT-gG-cC 파싱
+              try:
+                  parts = name.split("-")  # ['mcts', 'tT', 'gG', 'cC']
+                  g = int(parts[2][1:])
+              except (IndexError, ValueError):
+                  continue
+              if g not in goals:
+                  continue
+              if name not in best or a["created_at"] > best[name]["created_at"]:
+                  best[name] = a
+
+          if not best:
+              print("다운로드할 artifact가 없습니다.", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"다운로드 대상: {len(best)}개 artifact")
+          for name, a in sorted(best.items()):
+              aid = a["id"]
+              print(f"  {name} (id={aid})")
+              subprocess.run(
+                  ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/artifacts/{aid}/zip"],
+                  stdout=open(f"/tmp/{name}.zip", "wb"), check=True
+              )
+              subprocess.run(["unzip", "-o", f"/tmp/{name}.zip", "-d", "csv_in"], check=True, capture_output=True)
+          PY
+          echo "CSV 파일 수: $(find csv_in -name '*.csv' | wc -l)"
+
+      - name: Run Q2 regression analysis
+        run: |
+          mkdir -p out
+          .venv/bin/python q2_regression.py \
+            --csv-dir csv_in \
+            --bootstrap ${{ inputs.bootstrap }} \
+            --min-q-visits ${{ inputs.min_q_visits }} \
+            --min-state-samples ${{ inputs.min_state_samples }} \
+            --min-groups-per-bin ${{ inputs.min_groups_per_bin }} \
+            --output-prefix out/q2_tier_${{ inputs.tier }}
+          echo "--- threshold_summary ---"
+          cat out/q2_tier_${{ inputs.tier }}_threshold_summary.csv
+
+      - name: Upload Q2 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: q2-results-t${{ inputs.tier }}
+          path: out/q2_tier_${{ inputs.tier }}_*.csv
+          retention-days: 90
+          if-no-files-found: warn
