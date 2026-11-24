@@ -258,6 +258,7 @@ struct Record {
     std::array<int, 4> slot_tier{};
     std::array<int, 4> slot_matched{};
     std::array<int, 4> slot_match_event{};
+    std::array<int, 4> slot_match_action{};
     std::array<int, 4> slot_match_x{};
     std::array<int, 4> slot_match_step{};
     std::array<float, 4> slot_match_score{};
@@ -478,6 +479,7 @@ struct MCTSTree {
         int idx = 0;
         int switch_matched = -1, switch_bl_remaining = -1;
         auto previous_matched = get_matched_slots(b, goal);
+        int previous_action = -1;
 
         for (int depth = 0; depth < max_depth; ++depth) {
             Record rec;
@@ -492,6 +494,7 @@ struct MCTSTree {
                 if (current_matched[slot] && !previous_matched[slot]) {
                     rec.slot_match_event[slot] = 1;
                     rec.slot_match_step[slot] = depth;
+                    rec.slot_match_action[slot] = previous_action;
                     rec.slot_match_score[slot] =
                         slot_contribution(b[slot].opt_idx, b[slot].val);
                     if (switch_bl_remaining >= 0)
@@ -548,6 +551,7 @@ struct MCTSTree {
                 switch_bl_remaining = bl;
             }
 
+            previous_action = best_action;
             apply_action(b, bg, bl, best_action);
             idx = node.children[best_action];
             if (idx < 0) break;
@@ -568,6 +572,7 @@ struct MCTSTree {
                     if (terminal_matched[slot] && !previous_matched[slot]) {
                         terminal.slot_match_event[slot] = 1;
                         terminal.slot_match_step[slot] = depth + 1;
+                        terminal.slot_match_action[slot] = previous_action;
                         terminal.slot_match_score[slot] =
                             slot_contribution(b[slot].opt_idx, b[slot].val);
                         if (switch_bl_remaining >= 0)
@@ -666,10 +671,10 @@ static const std::string CSV_HEADER =
 "bg_spent,bl_spent,decision_step,terminal_reason,rng_seed,"
 "state_samples,state_progress_mean,state_matched_mean,state_bg_mean,state_bl_mean,state_score_mean,"
 "state_matched_min,state_matched_max,q_stop_visits,q_continue_visits,q_continue_action,"
-"slot0_opt_idx,slot0_value,slot0_tier,slot0_matched,slot0_match_event,slot0_match_x,slot0_match_step,slot0_match_score,"
-"slot1_opt_idx,slot1_value,slot1_tier,slot1_matched,slot1_match_event,slot1_match_x,slot1_match_step,slot1_match_score,"
-"slot2_opt_idx,slot2_value,slot2_tier,slot2_matched,slot2_match_event,slot2_match_x,slot2_match_step,slot2_match_score,"
-"slot3_opt_idx,slot3_value,slot3_tier,slot3_matched,slot3_match_event,slot3_match_x,slot3_match_step,slot3_match_score\n";
+"slot0_opt_idx,slot0_value,slot0_tier,slot0_matched,slot0_match_event,slot0_match_action,slot0_match_x,slot0_match_step,slot0_match_score,"
+"slot1_opt_idx,slot1_value,slot1_tier,slot1_matched,slot1_match_event,slot1_match_action,slot1_match_x,slot1_match_step,slot1_match_score,"
+"slot2_opt_idx,slot2_value,slot2_tier,slot2_matched,slot2_match_event,slot2_match_action,slot2_match_x,slot2_match_step,slot2_match_score,"
+"slot3_opt_idx,slot3_value,slot3_tier,slot3_matched,slot3_match_event,slot3_match_action,slot3_match_x,slot3_match_step,slot3_match_score\n";
 
 static constexpr int EXIT_INTERRUPTED = 75;       // SIGINT/SIGTERM 안전 종료
 
@@ -988,6 +993,7 @@ int run_mcts_pipeline(const MCTSConfig& cfg)
                       << "," << r.slot_tier[slot]
                       << "," << r.slot_matched[slot]
                       << "," << r.slot_match_event[slot]
+                      << "," << r.slot_match_action[slot]
                       << "," << r.slot_match_x[slot]
                       << "," << r.slot_match_step[slot]
                       << "," << r.slot_match_score[slot];
