@@ -560,6 +560,22 @@ struct MCTSTree {
             if (!has_legal_continue) {
                 Record terminal;
                 fill_state_record(terminal, b, bg, bl, depth + 1, 2);
+
+                // Preserve a match produced by the final light reroll even when
+                // that reroll leaves no legal continuation and ends the path.
+                const auto terminal_matched = get_matched_slots(b, goal);
+                for (size_t slot = 0; slot < terminal_matched.size(); ++slot) {
+                    if (terminal_matched[slot] && !previous_matched[slot]) {
+                        terminal.slot_match_event[slot] = 1;
+                        terminal.slot_match_step[slot] = depth + 1;
+                        terminal.slot_match_score[slot] =
+                            slot_contribution(b[slot].opt_idx, b[slot].val);
+                        if (switch_bl_remaining >= 0)
+                            terminal.slot_match_x[slot] = switch_bl_remaining - bl;
+                    }
+                }
+                previous_matched = terminal_matched;
+
                 fill_state_stats(terminal, nodes[idx]);
                 recs.push_back(terminal);
                 break;
