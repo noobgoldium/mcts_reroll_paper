@@ -36,7 +36,38 @@ jobs:
           ./mcts_engine --tier 0 --goal 0 --n_starts 2 --n_sim 100 --id_start 0 --id_end 1 --seed 123456 --out out/smoke.csv
           ./mcts_engine --tier 0 --goal 0 --n_starts 2 --n_sim 100 --id_start 0 --id_end 1 --seed 123456 --out out/smoke_repeat.csv
           cmp out/smoke.csv out/smoke_repeat.csv
-          .venv/bin/python -m py_compile q1_classifier.py q1_policy_analysis.py q2_regression.py
+          .venv/bin/python -m py_compile q1_classifier.py q1_policy_analysis.py q2_regression.py merge_mcts_chunks.py
+          mkdir -p out/merge_chunks out/merge_result
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+
+          root = Path("out/merge_chunks")
+          fields = ["resource_tier", "goal_id", "biscuit_id", "rng_seed", "decision_step"]
+          for chunk, ids in ((0, (0, 1)), (1, (2, 3))):
+              path = root / f"biscuit_tier_0_goal_0_chunk_{chunk}.csv"
+              with path.open("w", newline="", encoding="utf-8") as handle:
+                  writer = csv.DictWriter(handle, fieldnames=fields)
+                  writer.writeheader()
+                  for biscuit_id in ids:
+                      writer.writerow({
+                          "resource_tier": 0, "goal_id": 0,
+                          "biscuit_id": biscuit_id, "rng_seed": 1000 + biscuit_id,
+                          "decision_step": 0,
+                      })
+          PY
+          .venv/bin/python merge_mcts_chunks.py --input-dir out/merge_chunks --output-dir out/merge_result --tier 0 --goals 0 --chunks 0,1 --chunk-size 2
+          .venv/bin/python - <<'PY'
+          import csv
+          from pathlib import Path
+
+          path = Path("out/merge_result/biscuit_tier_0_merged.csv")
+          with path.open(newline="", encoding="utf-8") as handle:
+              rows = list(csv.DictReader(handle))
+          assert len(rows) == 4, f"expected 4 merged rows, got {len(rows)}"
+          assert {int(row["biscuit_id"]) for row in rows} == {0, 1, 2, 3}
+          print("validated merged CSV: 4 rows, complete biscuit ID coverage")
+          PY
           .venv/bin/python - <<'PY'
           import yaml
           for path in (".github/workflows/run_mcts.yml", ".github/workflows/validate-mcts.yml"):
