@@ -55,7 +55,7 @@ jobs:
           merge-multiple: true
           path: chunks
 
-      - name: Validate and merge CSV chunks
+      - name: Validate and merge CSV chunks (one file per goal)
         shell: bash
         run: |
           python3 merge_mcts_chunks.py \
@@ -66,10 +66,10 @@ jobs:
             --chunks "${{ inputs.chunks }}" \
             --chunk-size "${{ inputs.chunk_size }}"
 
-      - name: Upload merged CSV
+      - name: Upload merged goal CSV files
         uses: actions/upload-artifact@v4
         with:
           name: mcts-merged-t${{ inputs.tier }}-run-${{ inputs.run_id }}
-          path: merged/biscuit_tier_${{ inputs.tier }}_merged.csv
+          path: merged/*.csv
           if-no-files-found: error
           retention-days: 90
