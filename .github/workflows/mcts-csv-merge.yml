@@ -1,0 +1,75 @@
+name: MCTS CSV Merge (Existing Run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Source MCTS workflow run ID (the run that contains the chunk artifacts)"
+        required: true
+        type: string
+      tier:
+        description: "Resource tier"
+        required: true
+        default: "4"
+        type: string
+      goals:
+        description: "Comma-separated goal IDs"
+        required: true
+        default: "0,1,2,3,4,5,6,7,8,9"
+        type: string
+      chunks:
+        description: "Comma-separated chunk IDs"
+        required: true
+        default: "0,1,2,3,4,5,6,7,8,9"
+        type: string
+      chunk_size:
+        description: "Biscuits per chunk"
+        required: true
+        default: "10000"
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  merge:
+    name: Download and merge existing MCTS artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download artifacts from selected run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pattern: mcts-t${{ inputs.tier }}-g*-c*
+          merge-multiple: true
+          path: chunks
+
+      - name: Validate and merge CSV chunks
+        shell: bash
+        run: |
+          python3 merge_mcts_chunks.py \
+            --input-dir chunks \
+            --output-dir merged \
+            --tier "${{ inputs.tier }}" \
+            --goals "${{ inputs.goals }}" \
+            --chunks "${{ inputs.chunks }}" \
+            --chunk-size "${{ inputs.chunk_size }}"
+
+      - name: Upload merged CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcts-merged-t${{ inputs.tier }}-run-${{ inputs.run_id }}
+          path: merged/biscuit_tier_${{ inputs.tier }}_merged.csv
+          if-no-files-found: error
+          retention-days: 90
