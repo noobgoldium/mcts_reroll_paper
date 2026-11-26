@@ -30,16 +30,18 @@ on:
 
 permissions:
   actions: read
-  contents: read
+  contents: write
 
 jobs:
   merge:
-    name: Download and merge existing MCTS artifacts
+    name: Download, merge, and commit per-goal CSVs
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -66,10 +68,29 @@ jobs:
             --chunks "${{ inputs.chunks }}" \
             --chunk-size "${{ inputs.chunk_size }}"
 
-      - name: Upload merged goal CSV files
-        uses: actions/upload-artifact@v4
-        with:
-          name: mcts-merged-t${{ inputs.tier }}-run-${{ inputs.run_id }}
-          path: merged/*.csv
-          if-no-files-found: error
-          retention-days: 90
+      - name: Configure Git LFS
+        shell: bash
+        run: |
+          git lfs version
+          git lfs install --local
+          git lfs track "merged/*.csv"
+          git add .gitattributes
+
+      - name: Commit and push merged CSV files
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          TIER: ${{ inputs.tier }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add merged/*.csv
+
+          if git diff --cached --quiet; then
+            echo "No merged CSV changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Add merged MCTS CSVs for tier ${TIER} (run ${RUN_ID})"
+          git push origin HEAD:main
